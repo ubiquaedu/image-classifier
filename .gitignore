@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# Dati utente accumulati (non codice)
+ocr_testi.txt
+parole_escluse.txt
+immagine_prova_lens.png
+
+# Copie di backup
+* - Copia*.py
+
+# Ambiente Freebuff
+.freebuff/
+
+# Sistema
+Thumbs.db
+Desktop.ini
