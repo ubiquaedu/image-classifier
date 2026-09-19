@@ -69,3 +69,13 @@
 - Rinomina gruppo: candidati frequenti + sezione «Temi base» (tutti i temi di temi.txt, anche assenti dai testi).
 - «Escludi termine» duplicato nel pannello rinomina RIMOSSO; doppio click su tabella NON apre finestre (regola niente finestre); nota «scorri per i comandi» rimossa.
 - Piano completo: PIANO_UI_v3.md; mockup: mockup_v3.png (nota: il mockup ha l'immagine a sinistra, la realta' e' a destra come richiesto).
+
+
+## PIANO UI v4 (implementato, approvato dall'utente)
+- IMMAGINE A SINISTRA (60%), tabella file a DESTRA (40%): body col0=anteprima weight 3, col1=tabella+frequenze weight 2. Mockup: mockup_v4.png (script crea_mockup_v4.py).
+- NIENTE etichette sopra l'immagine: nome file/gruppo, badge salvataggio e info di contesto vanno nel DISPLAY di stato (riga B) via _set_status()/_log(). preview_header_var/preview_group_var restano solo per compatibilità ma non hanno più widget.
+- La ZONA D (testo OCR + card) vive DENTRO la card Anteprima (grid row 2), SOTTO l'immagine (grid row 1, weight 2 vs 1). Zona D vuota = grid_remove() → tutta l'altezza all'immagine. Pulsanti card su grid row 0 (più pack/grid misti in preview_card).
+- PUNTEGGIO NOMI GRUPPO (compute_proposed_names): copertura (doc_frequency) conta DOPPIO rispetto alla frequenza totale: sort key -(2*df + total). I temi confermati (temi.txt) danno priorità SOLO con df*2 >= n_immmagini del gruppo (prima bastava 1 immagine: era la causa dei nomi sbagliati tipo «what» al posto del termine comune 9/9). NB: what/which/can SONO già stopword inglesi nel programma (il test contrario era sbagliato per un errore di regex).
+- LINGUA PER IMMAGINE in «auto»: extract_text_two_pass() = passata 1 sulla STRISCIA SUPERIORE (crop 28% alto, single eng) → detect_language → passata 2 completa con la LINGUA SINGOLA rilevata (un modello invece di eng+ita). Variante con suffisso [lang]. Nei log appare «img: ok (fra)».
+- GRUPPI SISTEMATI: colonna ✔ (checkbox) nella tabella file — click sulla colonna #1 di una riga GRUPPO alterna il segno; persistente in D:\dizionari\gruppi_salvati.txt (load_saved_groups/add_saved_group/remove_saved_group). Effetti: esclusi dai salvataggi successivi e dalla FASE 3 (conferma con numero immagini escluse). Badge «✔ sistemato» nell'etichetta; il parsing dell'etichetta DEVE togliere PRIMA il badge e poi la copertura (regex in quest'ordine).
+- Test: tools_test_v4.py (9 test funzionali) + tools_smoke_v4.py (15 verifiche layout). Windows console cp1252: sempre PYTHONIOENCODING=utf-8.

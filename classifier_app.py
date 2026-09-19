@@ -96,7 +96,7 @@ ENGLISH_STOPWORDS = frozenset(
     too very can will just should now is are was were be been being have has
     had having do does did doing would could ought i you he she it we they
     them his her its our your their this that these those what which who
-    whom""".split()
+    whom never nobody""".split()
 )
 
 # Stopword francesi, tedesche e spagnole (multilingua automatica: rileviamo
@@ -429,6 +429,55 @@ def load_learned_vocabulary(
     return sorted(words)
 
 
+def saved_groups_file() -> "Path":
+    """File dei gruppi «già sistemati» (spunta ✔ nella tabella)."""
+    return DIZIONARI_DIR / "gruppi_salvati.txt"
+
+
+def load_saved_groups() -> set[str]:
+    """Nomi dei gruppi sistemati: uno per riga, # per commenti."""
+    f = saved_groups_file()
+    if not f.exists():
+        return set()
+    try:
+        out: set[str] = set()
+        for ln in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            name = ln.strip()
+            if name and not name.startswith("#"):
+                out.add(name)
+        return out
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def add_saved_group(name: str) -> None:
+    """Aggiunge un gruppo al file dei sistemati (senza duplicati)."""
+    try:
+        DIZIONARI_DIR.mkdir(parents=True, exist_ok=True)
+        groups = load_saved_groups()
+        if name in groups:
+            return
+        with saved_groups_file().open("a", encoding="utf-8") as fh:
+            fh.write(name + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def remove_saved_group(name: str) -> None:
+    """Toglie un gruppo dal file dei sistemati."""
+    f = saved_groups_file()
+    if not f.exists():
+        return
+    try:
+        lines = [
+            ln for ln in f.read_text(encoding="utf-8", errors="replace").splitlines()
+            if ln.strip() != name
+        ]
+        f.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def saved_ocr_texts(input_dir: Path | None) -> dict[str, str]:
     """Testi già riconosciuti, letti dal file accumulo ocr_testi.txt della
     cartella input: {nomefile: testo}. Serve per NON ri-scansionare con
@@ -689,6 +738,46 @@ def extract_text_from_image(path: Path, lang: str = "ita+eng") -> tuple[str, str
     except Exception as exc:  # noqa: BLE001 - l'OCR può fallire in molti modi
         logger.warning("OCR fallito su %s: %s", path.name, exc)
         return "", f"{type(exc).__name__}: {exc}", "errore"
+
+
+def extract_text_two_pass(path: "Path") -> tuple[str, str, str]:
+    """OCR «auto» in DUE passate (richiesta utente: scansione lenta).
+
+    Passata 1 veloce: striscia superiore dell'immagine (prima riga di
+    testo) con la sola lingua «eng» → detect_language sceglie la lingua.
+    Passata 2: OCR completo con la LINGUA SINGOLA rilevata (un modello
+    invece di due: molto più rapido). Ritorna (testo, errore, variante)
+    come extract_text_from_image.
+    """
+    try:
+        strip = _top_text_strip(path)
+        lang = "eng"
+        if strip is not None:
+            try:
+                head = pytesseract.image_to_string(strip, lang="eng").strip()
+                if head:
+                    lang = detect_language(head) or "eng"
+            except Exception:  # noqa: BLE001
+                lang = "eng"
+        text, error, variant = extract_text_from_image(path, lang)
+        if variant not in ("errore",) and text:
+            variant = f"{variant} [{lang}]"
+        return text, error, variant
+    except Exception as exc:  # noqa: BLE001
+        return "", f"{type(exc).__name__}: {exc}", "errore"
+
+
+def _top_text_strip(path: "Path"):
+    """Striscia superiore dell'immagine (dove di solito c'è la prima riga)."""
+    try:
+        with Image.open(path) as img:
+            base = _prepare_image(img.convert("RGB"))
+        w, h = base.size
+        if w < 10 or h < 10:
+            return None
+        return base.crop((0, 0, w, max(12, int(h * 0.28))))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _count_meaningful_words(text: str) -> int:
@@ -1086,9 +1175,19 @@ def compute_proposed_names(
         # i temi confermati dall'utente hanno PRIORITÀ a paritÀ:
         # sono i nomi giusti confermati nei set precedenti.
         total_of = dict(freqs)
+        n_imgs = max(1, len(member_texts))
         known_set = set(known)
+        # PUNTEGGIO (richiesta utente: «voglio il termine comune al gruppo»):
+        # la copertura (in quante immagini compare) conta DOPPIO rispetto
+        # alla frequenza totale. Un termine presente in 9/9 immagini batte
+        # uno spurio (what, which…) presente in più copie ma in meno
+        # immagini; i temi confermati hanno priorità SOLO con copertura
+        # magggiore o uguale a metà del gruppo (prima bastava 1 immagine).
         candidates.sort(
-            key=lambda c: (0 if c[0] in known_set else 1, -c[1], -total_of.get(c[0], 0))
+            key=lambda c: (
+                0 if (c[0] in known_set and c[1] * 2 >= n_imgs) else 1,
+                -(2 * c[1] + total_of.get(c[0], 0)),
+            )
         )
         best, best_df = candidates[0] if candidates else ("", 0)
         name = _sanitize_folder_name(best) or f"tema_{lab}"
@@ -1353,10 +1452,15 @@ class ClassifierApp:
         # la geometria della pagina non cambia mai quando l'app scrive.
         status_bar = ttk.Frame(main)
         status_bar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        # UI v4: la riga B è un DISPLAY: nome file/gruppo, badge salvataggio
+        # e contesto (prima erano etichette sopra l'immagine). _log e
+        # _set_status le fondono: l'ultimo messaggio vince sempre.
         self.status_var = tk.StringVar(value="Pronto.")
+        self._status_init_done = False
         ttk.Label(
             status_bar, textvariable=self.status_var, anchor="w",
             font=("TkDefaultFont", 9, "bold"), foreground="#1c4e8a",
+            wraplength=900,
         ).pack(side="left", fill="x", expand=True)
         self.progress = ttk.Progressbar(status_bar, mode="indeterminate", length=220)
         self.progress.pack(side="right")
@@ -1364,13 +1468,15 @@ class ClassifierApp:
         # ---------------- FASCIA C: TABELLA (sx) | ANTEPRIMA (dx) ----------------
         body = ttk.Frame(main)
         body.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
-        body.grid_columnconfigure(0, weight=1)  # sinistra: tabella+frequenze
-        body.grid_columnconfigure(1, weight=2)  # destra: anteprima PREVALENTE
+        # UI v4 (richiesta utente): IMMAGINE A SINISTRA e prevalente (60%),
+        # tabella file a destra (40%).
+        body.grid_columnconfigure(0, weight=3)  # sinistra: anteprima PREVALENTE
+        body.grid_columnconfigure(1, weight=2)  # destra: tabella+frequenze
         body.grid_rowconfigure(0, weight=1)
 
-        # -- C-sinistra: tabella file (scroll interna) + frequenze compatte
+        # -- C-destra (UI v4): tabella file (scroll interna) + frequenze
         left_col = ttk.Frame(body)
-        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left_col.grid(row=0, column=1, sticky="nsew")
         left_col.grid_rowconfigure(0, weight=1)
         left_col.grid_rowconfigure(1, weight=0)
         left_col.grid_columnconfigure(0, weight=1)
@@ -1378,14 +1484,16 @@ class ClassifierApp:
         tree_frame = ttk.Frame(left_col)
         tree_frame.grid(row=0, column=0, sticky="nsew")
         self.results_tree = ttk.Treeview(
-            tree_frame, columns=("thumb", "file", "tema", "stato"), show="headings"
+            tree_frame, columns=("salv", "thumb", "file", "tema", "stato"), show="headings"
         )
+        self.results_tree.heading("salv", text=" ✔")
         self.results_tree.heading("thumb", text="")
         self.results_tree.heading("file", text="File")
         self.results_tree.heading("tema", text="Tema / Cartella")
         self.results_tree.heading("stato", text="Stato")
+        self.results_tree.column("salv", width=34, stretch=False, anchor="center")
         self.results_tree.column("thumb", width=THUMB_SIZE + 16, stretch=False, anchor="center")
-        self.results_tree.column("file", width=250)
+        self.results_tree.column("file", width=240)
         self.results_tree.column("tema", width=170)
         self.results_tree.column("stato", width=70, anchor="center", stretch=False)
         tree_scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.results_tree.yview)
@@ -1408,33 +1516,23 @@ class ClassifierApp:
         self.freq_text.tag_configure("head", font=("TkDefaultFont", 9, "bold"))
         self._bind_mouse_wheel(self.freq_text)
 
-        # -- C-destra: ANTEPRIMA PREVALENTE (posizione FISSA per sempre)
+        # -- C-sinistra: ANTEPRIMA PREVALENTE (UI v4: immagine a sinistra)
         preview_card = ttk.LabelFrame(body, text="Anteprima", padding=6)
-        preview_card.grid(row=0, column=1, sticky="nsew")
+        preview_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         self._work_frame = preview_card
+        preview_card.grid_rowconfigure(1, weight=2)  # l'immagine prende la parte maggiore
+        preview_card.grid_rowconfigure(2, weight=1)  # la zona D (testo/card) il resto
 
+        # UI v4: niente messaggi sopra l'immagine — nome file, gruppo e
+        # info di contesto vivono nella RIGA DI STATO B (display). Le due
+        # variabili restano (sono aggiornate da tutto il codice) ma non
+        # hanno più etichette qui: sopra l'immagine restano SOLO i pulsanti.
         self.preview_header_var = tk.StringVar(value="Seleziona un'immagine nella tabella…")
-        ttk.Label(
-            preview_card,
-            textvariable=self.preview_header_var,
-            justify="left",
-            font=("TkDefaultFont", 9, "bold"),
-            wraplength=560,
-        ).pack(fill="x", pady=(0, 2))
-
         self.preview_group_var = tk.StringVar(value="")
-        self.preview_group_label = ttk.Label(
-            preview_card,
-            textvariable=self.preview_group_var,
-            justify="left",
-            wraplength=560,
-            foreground="#555555",
-        )
-        self.preview_group_label.pack(fill="x", pady=(0, 2))
 
         # Pulsanti anteprima SEMPRE sopra l'immagine, su due file.
         self.pv_btns = pv_btns = ttk.Frame(preview_card)
-        pv_btns.pack(fill="x", pady=(0, 4))
+        pv_btns.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         pv_row1 = ttk.Frame(pv_btns)
         pv_row1.pack(fill="x")
         self.btn_toggle_ocr = ttk.Button(
@@ -1478,14 +1576,18 @@ class ClassifierApp:
         self.btn_assign_group.config(state="disabled")
 
         self.preview_image_label = ttk.Label(preview_card, anchor="center")
-        self.preview_image_label.pack(fill="both", expand=True, pady=(0, 2))
+        self.preview_image_label.grid(row=1, column=0, sticky="nsew", pady=(0, 2))
 
         # ---------------- FASCIA D: ZONA CONTESTUALE (una card per volta) ----
         # Contenuto di default: testo OCR. Le card (Aggiungi testo, Scansione
         # avanzata, Cambia termine, Sposta nel gruppo) si aprono AL POSTO del
         # testo: una chiude le altre. La geometria di A/B/C non cambia MAI.
-        zone = ttk.Frame(main)
-        zone.grid(row=3, column=0, sticky="ew")
+        # UI v4: la zona contestuale vive DENTRO la colonna anteprima,
+        # SOTTO l'immagine: aprendo il testo l'immagine resta visibile in
+        # cima (ridotta), non sparisce e la geometria A/B non cambia.
+        zone = ttk.Frame(preview_card)
+        zone.grid(row=2, column=0, sticky="nsew", pady=(4, 0))
+        preview_card.grid_rowconfigure(2, weight=1)  # il testo prende il resto
         self._zone_d = zone
 
         self._ocr_text_visible = False
@@ -1692,6 +1794,15 @@ class ClassifierApp:
             self.manual_panel,
             self.adv_panel,
         ]
+        self._zone_d.grid_remove()  # all'avvio: tutta l'altezza all'immagine
+
+        # ---- CHECKBOX «GRUPPO GIÀ SISTEMATO» (richiesta utente): spunta
+        # sulla riga gruppo = escluso dai salvataggi successivi e dalla
+        # FASE 3. Persistente in D:\\dizionari\\gruppi_salvati.txt.
+        self._saved_groups: set[str] = load_saved_groups()
+        self._group_checks: dict[str, tk.BooleanVar] = {}
+        self._group_iids: dict[str, str] = {}
+        self.results_tree.bind("<Button-1>", self._on_tree_click, add="+")
 
         # Immagini segnaposto per la colonna miniature
         try:
@@ -1726,7 +1837,9 @@ class ClassifierApp:
             except Exception:  # noqa: BLE001
                 pass
         if widget is None:
-            return  # zona D vuota
+            self._zone_d.grid_remove()  # UI v4: tutta l'altezza all'immagine
+            return
+        self._zone_d.grid()
         if widget is self.preview_text:
             widget.pack(side="left", fill="both", expand=True)
             self._preview_scroll.pack(side="right", fill="y")
@@ -1855,8 +1968,19 @@ class ClassifierApp:
 
     # -- Utility thread / log ------------------------------------------------
 
+    def _set_status(self, message: str) -> None:
+        """UI v4: display di stato (riga B) — testo + contesto, una riga."""
+        self.status_var.set(message)
+
+
     def _log(self, message: str) -> None:
         self.log_queue.put(message)
+        # DISPLAY (UI v4): l'ultimo messaggio finisce nella riga B (come
+        # richiesto: i messaggi vanno nello status, non sopra l'immagine).
+        try:
+            self.root.after(0, self._set_status, message)
+        except RuntimeError:
+            pass
         # LOG SU FILE (piano UI v3): il log completo va in log_app.txt nella
         # cartella input (o accanto all'app se la cartella non è ancora
         # scelta) — fase di test. A video resta solo l'ultima riga importante.
@@ -2001,8 +2125,10 @@ class ClassifierApp:
                 done = 0
                 self._stop_event.clear()
                 pool = ThreadPoolExecutor(max_workers=2)  # 2 concorrenti: CPU non saturata
+                scan_fn = extract_text_two_pass if lang == "auto" else extract_text_from_image
                 futures = {
-                    pool.submit(extract_text_from_image, f, tess_lang): f for f in to_scan
+                    pool.submit(scan_fn, f) if lang == "auto" else pool.submit(extract_text_from_image, f, tess_lang): f
+                    for f in to_scan
                 }
                 try:
                     for fut in as_completed(futures):
@@ -2189,7 +2315,11 @@ class ClassifierApp:
             label = f"📁 {theme}"
             if info is not None and info.doc_count:
                 label += f"  ({info.doc_frequency}/{info.doc_count})"
-            g_iid = self.results_tree.insert("", "end", values=(self._thumb_full, label, "", ""))
+            chk = "☑" if theme in self._saved_groups else "☐"
+            if theme in self._saved_groups and label.endswith(")"):
+                label += "  ✔ sistemato"
+            g_iid = self.results_tree.insert("", "end", values=(chk, self._thumb_full, label, "", ""))
+            self._group_iids[theme] = g_iid
             if theme == select_theme or (select_theme is None and theme == prev_theme):
                 new_group_iid = g_iid
             for r in results:
@@ -2202,7 +2332,7 @@ class ClassifierApp:
                     new_child_iid = c_iid
         if unclassified:
             label = f"📁 senza testo  ({len(unclassified)})"
-            u_iid = self.results_tree.insert("", "end", values=(self._thumb_full, label, "", ""))
+            u_iid = self.results_tree.insert("", "end", values=("", self._thumb_full, label, "", ""))
             if select_theme == "__senza_testo__" or (
                 select_theme is None and prev_theme == "senza testo"
             ):
@@ -2243,6 +2373,36 @@ class ClassifierApp:
         self._thumbs[path.name] = photo
         return photo
 
+    def _on_tree_click(self, event: Any) -> None:  # noqa: ANN401
+        """Click sulla COLONNA ✔ (riga gruppo): attiva/disattiva «sistemato»."""
+        try:
+            iid = self.results_tree.identify_row(event.y)
+            col = self.results_tree.identify_column(event.x)
+        except tk.TclError:
+            return
+        if not iid or col != "#1":
+            return
+        values = self.results_tree.item(iid, "values")
+        if not values or len(values) < 3:
+            return
+        label = str(values[2])
+        if not label.startswith("📁"):
+            return  # la spunta vale solo sulle righe di GRUPPO
+        theme = re.sub(r"\s+✔\s*sistemato$", "", label[1:].strip()).strip()
+        theme = re.sub(r"\s+\(\d+/\d+\)$", "", theme).strip()
+        if not theme:
+            return
+        if theme in self._saved_groups:
+            self._saved_groups.discard(theme)
+            remove_saved_group(theme)
+            self._log(f"✔ «{theme}» di nuovo attivo: rientra nei salvataggi e nella FASE 3.")
+        else:
+            self._saved_groups.add(theme)
+            add_saved_group(theme)
+            self._log(f"☑ «{theme}» segnato SISTEMATO: escluso dai salvataggi e dalla FASE 3.")
+        self._fill_results_tree()
+
+
     def _selected_doc_and_theme(self) -> tuple[Doc | None, str]:
         """Documento e tema della riga selezionata (None se è una riga di gruppo)."""
         selected = self.results_tree.selection()
@@ -2254,8 +2414,8 @@ class ClassifierApp:
             return None, ""  # selezione obsoleta (riga ricreata)
         if not values or len(values) < 3:
             return None, ""
-        filename = str(values[1])
-        theme = str(values[2])
+        filename = str(values[2])
+        theme = str(values[3])
         if not filename or not theme:
             return None, ""  # riga di gruppo
         doc = next((r.doc for r in self.state.results if r.doc.path.name == filename), None)
@@ -2275,12 +2435,14 @@ class ClassifierApp:
             values = self.results_tree.item(selected[0], "values")
         except tk.TclError:
             return None  # selezione obsoleta (riga ricreata)
-        if values and len(values) >= 2:
-            label = str(values[1])
+        if values and len(values) >= 3:
+            label = str(values[2])
             if label.startswith("📁 "):
                 name = label[2:].strip()
-                # toglie la copertura finale, es. "scontrino  (3/3)" -> "scontrino"
-                return re.sub(r"\s+\(\d+/\d+\)$", "", name)
+                # toglie il badge «sistemato» e poi la copertura finale,
+                # es. "what  (6/8)  ✔ sistemato" -> "what"
+                name = re.sub(r"\s+✔\s*sistemato$", "", name).strip()
+                return re.sub(r"\s+\(\d+/\d+\)$", "", name).strip()
         return None
 
     def _on_tree_select(self, event: Any = None) -> None:  # noqa: ANN401
@@ -2334,6 +2496,7 @@ class ClassifierApp:
     def _clear_preview(self) -> None:
         self.preview_header_var.set("Seleziona un'immagine nella tabella…")
         self.preview_group_var.set("")
+        self._set_status("Seleziona un'immagine nella tabella…")
         self.preview_image_label.config(image="", text="")
         self._preview_photo = None
         self._current_preview_doc = None
@@ -2894,10 +3057,9 @@ class ClassifierApp:
 
         info = self._theme_info(theme)
         n = info.doc_count if info else len([r for r in self.state.results if r.primary_topic == theme])
-        cands = ", ".join(f"{c} ({df}/{n})" for c, df in (info.candidates[:8] if info else []))
-        self.preview_group_var.set(
-            f"Il nome della cartella vale per tutte le {n} immagini del gruppo.\n"
-            f"Termini candidati: {cands or 'n/d'}"
+        cands = ", ".join(f"{c} ({df}/{n})" for c, df in (info.candidates[:5] if info else []))
+        self._set_status(
+            f"GRUPPO: 📁 {theme} ({n} immagini)   ·   candidati: {cands or 'n/d'}"
         )
 
         self.preview_text.config(state="normal")
@@ -2957,20 +3119,18 @@ class ClassifierApp:
 
             with Image.open(doc.path) as img:
                 img = img.convert("RGB")
-                img.thumbnail((280, 280), Image.Resampling.LANCZOS)
+                img.thumbnail((640, 640), Image.Resampling.LANCZOS)  # UI v4: colonna prevalente
                 photo = ImageTk.PhotoImage(img)
             self.preview_image_label.config(image=photo, text="")
             self._preview_photo = photo  # evita il garbage collection
         except Exception as exc:  # noqa: BLE001
             self.preview_image_label.config(image="", text=f"Immagine non leggibile:\n{exc}")
 
-        # BADGE SU RIGA SEPARATA (richiesta utente): su una riga sola si
-        # confondeva con il nome del file a seconda della lunghezza.
+        # UI v4: badge e contesto nel DISPLAY di stato (niente etichette
+        # sopra l'immagine).
         saved = doc.path.name in self._saved_ocr_names()
-        badge = "💾 già salvato in ocr_testi.txt" if saved else "⬜ non ancora salvato"
-        self.preview_header_var.set(
-            f"{doc.path.name}    →    📁 {theme}\n{badge}"
-        )
+        badge = "💾 già salvato" if saved else "⬜ non salvato"
+        self._set_status(f"{doc.path.name}  →  📁 {theme}   ·   {badge}")
 
         self.preview_text.config(state="normal")
         self.preview_text.delete("1.0", "end")
@@ -3458,19 +3618,33 @@ class ClassifierApp:
                 return
         self.state.output_dir = output_dir
 
+        n_ok = len([r for r in self.state.results if not r.doc.error])
         if not messagebox.askyesno(
             "Conferma",
-            f"Spostare {len([r for r in self.state.results if not r.doc.error])} immagini "
-            f"in sottocartelle per tema dentro:\n{output_dir}?",
+            f"Spostare {n_ok} immagini in sottocartelle per tema dentro:\n{output_dir}?",
         ):
             return
 
+        # GRUPPI SISTEMATI (richiesta utente): i gruppi con la spunta ✔ sono
+        # già archiviati — nessuna cartella nuova, nessun file spostato.
+        todo = [
+            r for r in self.state.results
+            if r.primary_topic not in self._saved_groups and not r.doc.error
+        ]
+        skipped = len([r for r in self.state.results if not r.doc.error]) - len(todo)
+        if todo and skipped:
+            if not messagebox.askyesno(
+                "Gruppi già sistemati",
+                f"{skipped} immagini appartengono a gruppi ✔ sistemati e NON verranno spostate.\n"
+                f"Spostare le {len(todo)} immagini rimanenti?",
+            ):
+                return
         self._set_busy(True)
         self._log("\n📦 FASE 3 - Spostamento delle immagini nelle cartelle per tema…")
 
         def worker() -> None:
             try:
-                moved = move_files_to_folders(self.state.results, output_dir)
+                moved = move_files_to_folders(todo, output_dir)
                 report = write_report(self.state.results, output_dir)
                 self.root.after(0, lambda: self._after_move(moved, report))
             except Exception as exc:  # noqa: BLE001
