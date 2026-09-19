@@ -5,6 +5,7 @@ __pycache__/
 # Dati utente accumulati (non codice)
 ocr_testi.txt
 parole_escluse.txt
+log_app.txt
 immagine_prova_lens.png
 
 # Copie di backup

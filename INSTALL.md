@@ -58,8 +58,12 @@ I **nomi confermati dei gruppi** — cioè i temi veri, comuni a più set di imm
 - Un tema conosciuto **mai usato come nome se non compare nei testi** del gruppo: non viene mai forzato.
 - Puoi anche modificare il file a mano con il Blocco note.
 
-## Interfaccia (stile pagina web)
+## Interfaccia (piano UI v3 — una schermata, fasce fisse)
 
-
-
-Interfaccia v2 (mockup_v2.jpg): zone impilate — Cartelle, pulsanti principali, LOG IN ALTO, tabella immagini, frequenze parole, nota [scorri per i comandi], zona di lavoro a due colonne (anteprima a sinistra, testo OCR a destra) con i comandi normali e quelli della scansione avanzata sotto. La rotella scrolla la pagina ovunque; dopo ogni fase la vista si porta da sola sul log, e alla selezione di una immagine sulle frequenze.
+Interfaccia a SCHERMATA UNICA, niente scroll di pagina: la rotella scrolla solo la tabella e i testi.
+- FASCIA A - Comandi: cartelle input/output, lingua OCR, pulsanti 1 OCR / 2 Temi / 3 Sposta, Esporta CSV e STOP (attivo solo durante la scansione: interrompe l'elaborazione lasciando validi i risultati gia' pronti).
+- FASCIA B - Stato: UNA riga con l'ultimo messaggio importante + barra di progresso. Il log completo va nel file log_app.txt (cartella input; menu Extra -> Apri log_app.txt).
+- FASCIA C - a sinistra tabella file con miniature (scroll interna) e pannello frequenze compatto; a destra ANTEPRIMA IMMAGINE PREVALENTE con i pulsanti sopra: la posizione non cambia mai.
+- FASCIA D - Zona contestuale: mostra UNA card per volta (testo OCR di default; poi Aggiungi testo, Scansione avanzata, Cambia termine, Sposta nel gruppo). Aprire una card chiude le altre; Chiudi/Annulla torna al testo OCR. L'anteprima e la tabella NON si muovono mai.
+- Menu «Extra»: Esporta frequenze CSV, Apri log_app.txt, Dizionario temi (temi.txt), Termini esclusi (escluse.txt).
+- Il pannello «Cambia termine del GRUPPO» propone i candidati frequenti del gruppo PIU' i TEMI BASE del dizionario temi.txt (utilizzabili anche se assenti dai testi del gruppo).

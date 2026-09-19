@@ -58,3 +58,14 @@
 - `classify_documents` considera SOLO i doc con testo non vuoto; l'etichetta di gruppo include la copertura `(n/N)` da rimuovere col regex quando si recupera il nome tema.
 - [CERCA E SOSTITUISCI MANUALE (editor Aggiungi testo)]: riga con campi «Cerca» / «Sostituisci con» + pulsante «🔄 Sostituisci» RIUTILIZZABILE N volte di seguito (i campi restano compilati; ogni pressione lavora sul testo corrente). Case-insensitive, SENZA confini di parola (trova frammenti incollati: cerca=drink → SIPDRINK diventa SIP). Campo sostituisci vuoto = sola rimozione. Pulizia spazi/righe vuote dopo ogni passata; Log con occorrenze. Regola utente: i frammenti di sfondo variano con l OCR — l utente li corregge a mano, non in automatico.
 - [EDITOR TERMINE SEGUE LA SELEZIONE]: con il pannello «Cambia termine del GRUPPO» aperto, cliccando un'immagine di un ALTRO gruppo nella tabella il pannello si aggiorna automaticamente ai candidati del nuovo gruppo (prima restava con i candidati del gruppo iniziale e l utente non riuscia a rinominare gli altri gruppi). Log: «Editor termine ora sul GRUPPO x». Se si clicca un'immagine dello STESSO gruppo il pannello non cambia.
+
+
+## PIANO UI v3 (implementato, approvato dall'utente)
+- Layout a SCHERMATA UNICA: 4 fasce fisse (Comandi / Stato 1 riga / Tabella+Anteprima / Zona contestuale). ELIMINATO lo scroll di pagina (page_canvas rimosso): non reintrodurlo.
+- ANTEPRIMA IMMAGINE FISSA A DESTRA: non si muove mai quando si aprono i pannelli; tabella+frequenze a sinistra.
+- LOG: a video SOLO 1 riga di stato (status_var sotto i comandi) + Progressbar; log completo su log_app.txt (cartella input) via _log(). Non risettare un widget log grande.
+- ZONA D «una card per volta»: _show_zone_d() mostra un solo widget tra preview_text/rename/assign/manual/adv; ogni card ha i propri pulsanti Chiudi/Annulla che tornano al testo OCR (_close_*_panel). La card Scansione avanzata ha una PROPRIA area risultati (adv_result_text): non scrivere i suoi risultati nel testo OCR.
+- PULSANTE STOP (⏹ Ferma scansione): attivo SOLO durante la FASE 1 (_scan_stop_enabled); stop_event + pool.shutdown(cancel_futures=True); i risultati parziali restano validi.
+- Rinomina gruppo: candidati frequenti + sezione «Temi base» (tutti i temi di temi.txt, anche assenti dai testi).
+- «Escludi termine» duplicato nel pannello rinomina RIMOSSO; doppio click su tabella NON apre finestre (regola niente finestre); nota «scorri per i comandi» rimossa.
+- Piano completo: PIANO_UI_v3.md; mockup: mockup_v3.png (nota: il mockup ha l'immagine a sinistra, la realta' e' a destra come richiesto).
