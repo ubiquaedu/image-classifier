@@ -25,13 +25,48 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import tkinter as tk
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 from typing import Any
 
 import pytesseract
+
+# ---- ttkbootstrap (pulsanti colorati): opzionale con ripiego -------
+# Se la libreria non e' installata, l'app parte identica con lo stile
+# ttk standard: i parametri bootstyle= sono accettati solo se il patch
+# globale e' attivo (TTK_BOOTSTRAP = True).
+try:
+    import ttkbootstrap as _ttb  # noqa: F401
+
+    TTK_BOOTSTRAP = True
+except ImportError:  # pragma: no cover
+    _ttb = None
+    TTK_BOOTSTRAP = False
+
+
+def _bs(color: str) -> dict[str, str]:
+    """kwargs di stile solo se ttkbootstrap e' attivo (altrimenti {})."""
+    if not TTK_BOOTSTRAP:
+        return {}
+    return {"bootstyle": _BS_COLORS.get(color, color)}
+
+
+# UI v5.1 (chiarimento utente): SOLO i pulsanti di FASE (1,2,3) sono
+# grigio-scuro uniforme; gli altri tornano ai loro colori: salva = verde,
+# stop = rosso, azioni di scansione = azzurro, neutri = grigio-scuro.
+_BS_COLORS = {
+    "fase": "dark",
+    "csv": "dark-outline",
+    "stop": "danger",
+    "salva": "success",
+    "avanza": "info",
+    "second": "dark",
+    "chiudi": "dark-outline",
+}
 
 # Limita i thread interni di Tesseract (OMP): senza questo limite ogni
 # processo Tesseract apriva più thread in parallelo e, con più processi
@@ -94,7 +129,7 @@ ENGLISH_STOPWORDS = frozenset(
     too very can will just should now is are was were be been being have has
     had having do does did doing would could ought i you he she it we they
     them his her its our your their this that these those what which who
-    whom""".split()
+    whom never nobody""".split()
 )
 
 # Stopword francesi, tedesche e spagnole (multilingua automatica: rileviamo
@@ -427,6 +462,55 @@ def load_learned_vocabulary(
     return sorted(words)
 
 
+def saved_groups_file() -> "Path":
+    """File dei gruppi «già sistemati» (spunta ✔ nella tabella)."""
+    return DIZIONARI_DIR / "gruppi_salvati.txt"
+
+
+def load_saved_groups() -> set[str]:
+    """Nomi dei gruppi sistemati: uno per riga, # per commenti."""
+    f = saved_groups_file()
+    if not f.exists():
+        return set()
+    try:
+        out: set[str] = set()
+        for ln in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            name = ln.strip()
+            if name and not name.startswith("#"):
+                out.add(name)
+        return out
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def add_saved_group(name: str) -> None:
+    """Aggiunge un gruppo al file dei sistemati (senza duplicati)."""
+    try:
+        DIZIONARI_DIR.mkdir(parents=True, exist_ok=True)
+        groups = load_saved_groups()
+        if name in groups:
+            return
+        with saved_groups_file().open("a", encoding="utf-8") as fh:
+            fh.write(name + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def remove_saved_group(name: str) -> None:
+    """Toglie un gruppo dal file dei sistemati."""
+    f = saved_groups_file()
+    if not f.exists():
+        return
+    try:
+        lines = [
+            ln for ln in f.read_text(encoding="utf-8", errors="replace").splitlines()
+            if ln.strip() != name
+        ]
+        f.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def saved_ocr_texts(input_dir: Path | None) -> dict[str, str]:
     """Testi già riconosciuti, letti dal file accumulo ocr_testi.txt della
     cartella input: {nomefile: testo}. Serve per NON ri-scansionare con
@@ -687,6 +771,46 @@ def extract_text_from_image(path: Path, lang: str = "ita+eng") -> tuple[str, str
     except Exception as exc:  # noqa: BLE001 - l'OCR può fallire in molti modi
         logger.warning("OCR fallito su %s: %s", path.name, exc)
         return "", f"{type(exc).__name__}: {exc}", "errore"
+
+
+def extract_text_two_pass(path: "Path") -> tuple[str, str, str]:
+    """OCR «auto» in DUE passate (richiesta utente: scansione lenta).
+
+    Passata 1 veloce: striscia superiore dell'immagine (prima riga di
+    testo) con la sola lingua «eng» → detect_language sceglie la lingua.
+    Passata 2: OCR completo con la LINGUA SINGOLA rilevata (un modello
+    invece di due: molto più rapido). Ritorna (testo, errore, variante)
+    come extract_text_from_image.
+    """
+    try:
+        strip = _top_text_strip(path)
+        lang = "eng"
+        if strip is not None:
+            try:
+                head = pytesseract.image_to_string(strip, lang="eng").strip()
+                if head:
+                    lang = detect_language(head) or "eng"
+            except Exception:  # noqa: BLE001
+                lang = "eng"
+        text, error, variant = extract_text_from_image(path, lang)
+        if variant not in ("errore",) and text:
+            variant = f"{variant} [{lang}]"
+        return text, error, variant
+    except Exception as exc:  # noqa: BLE001
+        return "", f"{type(exc).__name__}: {exc}", "errore"
+
+
+def _top_text_strip(path: "Path"):
+    """Striscia superiore dell'immagine (dove di solito c'è la prima riga)."""
+    try:
+        with Image.open(path) as img:
+            base = _prepare_image(img.convert("RGB"))
+        w, h = base.size
+        if w < 10 or h < 10:
+            return None
+        return base.crop((0, 0, w, max(12, int(h * 0.28))))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _count_meaningful_words(text: str) -> int:
@@ -1084,9 +1208,19 @@ def compute_proposed_names(
         # i temi confermati dall'utente hanno PRIORITÀ a paritÀ:
         # sono i nomi giusti confermati nei set precedenti.
         total_of = dict(freqs)
+        n_imgs = max(1, len(member_texts))
         known_set = set(known)
+        # PUNTEGGIO (richiesta utente: «voglio il termine comune al gruppo»):
+        # la copertura (in quante immagini compare) conta DOPPIO rispetto
+        # alla frequenza totale. Un termine presente in 9/9 immagini batte
+        # uno spurio (what, which…) presente in più copie ma in meno
+        # immagini; i temi confermati hanno priorità SOLO con copertura
+        # magggiore o uguale a metà del gruppo (prima bastava 1 immagine).
         candidates.sort(
-            key=lambda c: (0 if c[0] in known_set else 1, -c[1], -total_of.get(c[0], 0))
+            key=lambda c: (
+                0 if (c[0] in known_set and c[1] * 2 >= n_imgs) else 1,
+                -(2 * c[1] + total_of.get(c[0], 0)),
+            )
         )
         best, best_df = candidates[0] if candidates else ("", 0)
         name = _sanitize_folder_name(best) or f"tema_{lab}"
@@ -1243,6 +1377,9 @@ class ClassifierApp:
         self.state = AppState()
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.busy = False
+        # STOP della FASE 1 (piano UI v3): flag condiviso col thread worker.
+        self._stop_event = threading.Event()
+        self._scan_stop_enabled = False  # True solo durante la FASE 1
 
         self._build_ui()
         self._poll_log_queue()
@@ -1250,8 +1387,39 @@ class ClassifierApp:
 
     # -- UI ----------------------------------------------------------------
 
+
     def _build_ui(self) -> None:
-        main = ttk.Frame(self.root, padding=10)
+        global TTK_BOOTSTRAP
+        # MENU «Extra»: funzioni secondarie fuori dai pulsanti principali.
+        menubar = tk.Menu(self.root)
+        extra = tk.Menu(menubar, tearoff=0)
+        extra.add_command(label="Esporta frequenze per gruppo (CSV)", command=self._show_word_frequencies)
+        extra.add_command(label="🧹 Pulizia temi spurii (una tantum)…", command=self._cleanup_spurious_themes)
+        extra.add_command(label="Apri log_app.txt", command=self._open_log_file)
+        extra.add_command(label="Dizionario temi (temi.txt)", command=lambda: self._open_text_file(TEMI_FILE))
+        extra.add_command(label="Termini esclusi (escluse.txt)", command=lambda: self._open_text_file(EXCLUSIONS_FILE))
+        menubar.add_cascade(label="Extra", menu=extra)
+        self.root.config(menu=menubar)
+
+        # ---- Tema ttkbootstrap (pulsanti colorati), con ripiego sicuro ----
+        # Da qui in poi i widget ttk accettano bootstyle="colore"; senza
+        # libreria i parametri vengono semplicemente omessi (_bs -> {}). La
+        # traduzione ruolo->colore vive in _BS_COLORS (livello modulo).
+        if TTK_BOOTSTRAP and _ttb is not None:
+            try:
+                # flatly = tema chiaro con colori SATURI (cosmo era sbiadito,
+                # richiesta utente). I pulsanti neutri usano il token nativo
+                # «dark» (grigio-scuro pieno) sempre leggibile su fondo chiaro.
+                _ttb.Style(theme="flatly")
+                _ttb.Bootstyle.setup_ttkbootstrap_api()
+                # NB: la mappa degli stati (attivo/disattivo) si applica alla
+                # FINE di _build_ui: ttkbootstrap la riscrive mentre crea i
+                # widget, quindi qui sarebbe inutile.
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning("ttkbootstrap non attivato: %s", _exc)
+                TTK_BOOTSTRAP = False
+
+        main = ttk.Frame(self.root, padding=6)
         main.pack(fill="both", expand=True)
 
         # Stile «in corso» per la card Scansione avanzata: bordo blu evidente
@@ -1268,26 +1436,31 @@ class ClassifierApp:
         except tk.TclError:
             pass
 
-        # FASCIA 1: due metà affiancate — Cartelle (sx) | Pulsanti generali (dx)
-        top_band = ttk.Frame(main)
-        top_band.pack(fill="x", pady=(0, 8))
+        # LAYOUT A SCHERMATA UNICA (piano UI v3): 4 fasce fisse impilate con
+        # grid. NIENTE scroll della pagina: l'anteprima e la tabella non si
+        # muovono mai; la rotella scrolla solo i testi/tabelle interni.
+        main.grid_rowconfigure(2, weight=1)  # la fascia C prende l'altezza residua
+        main.grid_columnconfigure(0, weight=1)
 
-        # Sezione cartelle (metà sinistra)
-        folders = ttk.LabelFrame(top_band, text="Cartelle", padding=8)
+        # ---------------- FASCIA A: COMANDI (fissa in alto) ----------------
+        top_band = ttk.Frame(main)
+        top_band.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+
+        folders = ttk.LabelFrame(top_band, text="Cartelle", padding=6)
         folders.pack(side="left", fill="both", expand=True, padx=(0, 6))
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
-        self.lang_var = tk.StringVar(value="eng")  # default ENG (richiesta utente: default ENG, non auto eng+ita)
+        self.lang_var = tk.StringVar(value="eng")  # default ENG (richiesta utente)
 
         ttk.Label(folders, text="Immagini (input):").grid(row=0, column=0, sticky="w")
         ttk.Entry(folders, textvariable=self.input_var).grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Button(folders, text="Sfoglia…", command=self._browse_input).grid(row=0, column=2)
+        ttk.Button(folders, text="Sfoglia…", command=self._browse_input, **_bs("second")).grid(row=0, column=2)
         ttk.Label(folders, text="Output:").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Entry(folders, textvariable=self.output_var).grid(
             row=1, column=1, sticky="ew", padx=6, pady=(4, 0)
         )
-        ttk.Button(folders, text="Sfoglia…", command=self._browse_output).grid(
+        ttk.Button(folders, text="Sfoglia…", command=self._browse_output, **_bs("second")).grid(
             row=1, column=2, pady=(4, 0)
         )
         ttk.Label(folders, text="Lingua OCR:").grid(row=2, column=0, sticky="w", pady=(4, 0))
@@ -1297,135 +1470,129 @@ class ClassifierApp:
         )
         lang_cb.grid(row=2, column=1, sticky="w", padx=6, pady=(4, 0))
         folders.columnconfigure(1, weight=1)
-        # La lingua OCR è ora una tendina compatta inline (niente finestra a parte).
         self._lang_combo = lang_cb
 
-        # Pulsanti generali (metà destra della fascia 1) — la barra è
-        # scrollabile orizzontalmente se la finestra è stretta (stile mobile):
-        # niente pulsanti mai invisibili.
-        buttons_wrap = ttk.LabelFrame(top_band, text="Comandi", padding=(4, 6))
-        buttons_wrap.pack(side="left", fill="both", expand=True)
-        buttons_canvas = tk.Canvas(buttons_wrap, height=80, highlightthickness=0)
-        buttons_hbar = ttk.Scrollbar(
-            buttons_wrap, orient="horizontal", command=buttons_canvas.xview
-        )
-        buttons_canvas.configure(xscrollcommand=buttons_hbar.set)
-        buttons_hbar.pack(side="bottom", fill="x")
-        buttons_canvas.pack(side="top", fill="both", expand=True)
-        buttons = ttk.Frame(buttons_canvas)
-        buttons_canvas.create_window((0, 0), window=buttons, anchor="nw")
-        buttons.bind(
-            "<Configure>",
-            lambda _e: buttons_canvas.configure(scrollregion=buttons_canvas.bbox("all")),
-        )
-        self._buttons_canvas = buttons_canvas
-
+        commands = ttk.LabelFrame(top_band, text="Comandi", padding=6)
+        commands.pack(side="left", fill="both")
         self.btn_extract = ttk.Button(
-            buttons, text="1️⃣  Estrai testo (OCR)", command=self._run_extraction
+            commands, text="1️⃣  Estrai testo (OCR)", command=self._run_extraction, **_bs("fase")
         )
-        self.btn_extract.pack(side="left")
+        self.btn_extract.pack(side="left", padx=(0, 6))
         self.btn_classify = ttk.Button(
-            buttons, text="2️⃣  Trova temi e classifica", command=self._run_classification
+            commands, text="2️⃣  Trova temi e classifica", command=self._run_classification, **_bs("fase")
         )
-        self.btn_classify.pack(side="left", padx=8)
+        self.btn_classify.pack(side="left", padx=(0, 6))
         self.btn_move = ttk.Button(
-            buttons, text="3️⃣  Sposta nelle cartelle", command=self._run_move
+            commands, text="3️⃣  Sposta nelle cartelle", command=self._run_move, **_bs("fase")
         )
-        self.btn_move.pack(side="left")
-        self.btn_freq = ttk.Button(
-            buttons, text="💾 Esporta frequenze CSV", command=self._show_word_frequencies
+        self.btn_move.pack(side="left", padx=(0, 6))
+        # PULSANTE STOP (richiesta utente): interrompe la FASE 1 a metà
+        # (es. 400 file con lingua sbagliata). Attivo solo durante la scansione.
+        self.btn_stop = ttk.Button(
+            commands, text="⏹  Ferma scansione", command=self._stop_scan, **_bs("stop"),
+            state="disabled",
         )
-        self.btn_freq.pack(side="left", padx=8)
-        self.btn_freq.config(state="disabled")
+        self.btn_stop.pack(side="left")
+        # v6.8 (richiesta utente): il pulsante «Esporta CSV» è TOLTO dalla
+        # fascia — l'esportazione delle frequenze per gruppo sta nel menu
+        # Extra. La fascia comandi resta pulita.
+        # v6.7 (richiesta utente): indicatori di progressione SOTTO i pulsanti
+        # 1️⃣ 2️⃣ 3️⃣ — 1 file in scansione, 2 temi trovati, 3 cartelle generate.
+        # Ogni indicatore sta sotto il SUO pulsante: struttura a griglia.
+        # pack e grid NON coesistono nello stesso frame: si rimuovono TUTTI
+        # i pulsanti dal pack prima di ricrearli in griglia.
+        for _b in (self.btn_extract, self.btn_classify, self.btn_move,
+                   self.btn_stop):
+            _b.pack_forget()
+        commands.grid_columnconfigure(0, weight=1)
+        commands.grid_columnconfigure(1, weight=1)
+        commands.grid_columnconfigure(2, weight=1)
+        self.btn_extract.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        self.btn_classify.grid(row=0, column=1, padx=(0, 6), sticky="ew")
+        self.btn_move.grid(row=0, column=2, padx=(0, 6), sticky="ew")
+        self._prog1_var = tk.StringVar(value="—")
+        self._prog2_var = tk.StringVar(value="—")
+        self._prog3_var = tk.StringVar(value="—")
+        ttk.Label(
+            commands, textvariable=self._prog1_var, anchor="center",
+            font=("TkDefaultFont", 8), foreground="#555555",
+        ).grid(row=1, column=0, sticky="ew")
+        ttk.Label(
+            commands, textvariable=self._prog2_var, anchor="center",
+            font=("TkDefaultFont", 8), foreground="#555555",
+        ).grid(row=1, column=1, sticky="ew")
+        ttk.Label(
+            commands, textvariable=self._prog3_var, anchor="center",
+            font=("TkDefaultFont", 8), foreground="#555555",
+        ).grid(row=1, column=2, sticky="ew")
+        # STOP in colonna a destra (stesso gestore grid — niente pack/grid misti).
+        self.btn_stop.grid(row=0, column=3, rowspan=2, padx=(8, 0), sticky="ns")
 
-        # Progress (SEMPRE in pagina: la barra rimane anche quando ferma —
-        # se venisse mostrata/nascosta a ogni operazione, tutto il contenuto
-        # sotto salirebbe/scenderebbe al suo avvio)
-        self.progress = ttk.Progressbar(main, mode="indeterminate")
-        self.progress.pack(fill="x", pady=(0, 8))
+        # ---------------- FASCIA B: STATO (1 riga) + progresso ----------------
+        # Il log esteso NON è più a video: va tutto in log_app.txt (fase di
+        # test). Qui resta solo l'ULTIMO messaggio importante, su una riga:
+        # la geometria della pagina non cambia mai quando l'app scrive.
+        # UI v5: filetto attorno alla riga di stato (come le altre card).
+        status_bar = ttk.LabelFrame(main, text="Stato", padding=(6, 2))
+        status_bar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        # UI v4: la riga B è un DISPLAY: nome file/gruppo, badge salvataggio
+        # e contesto (prima erano etichette sopra l'immagine). _log e
+        # _set_status le fondono: l'ultimo messaggio vince sempre.
+        self.status_var = tk.StringVar(value="Pronto.")
+        self._status_init_done = False
+        # v6.8 (richiesta utente): NIENTE a capo — con wraplength i messaggi
+        # lunghi della FASE 2 andavano su due righe e la fascia «saltava»,
+        # poi tornava a posto con i messaggi brevi. Una riga singola sempre:
+        # il testo in eccesso viene tagliato a video (il log completo sta in
+        # log_app.txt e nel menu Extra).
+        ttk.Label(
+            status_bar, textvariable=self.status_var, anchor="w",
+            font=("TkDefaultFont", 9, "bold"), foreground="#1c4e8a",
+            wraplength=0,
+        ).pack(side="left", fill="x", expand=True)
+        self.progress = ttk.Progressbar(status_bar, mode="indeterminate", length=220)
+        self.progress.pack(side="right")
+        # UI v6: CONTATORE scansioni accanto alla barra ping-pong (fuori dai
+        # messaggi di stato, che restano solo testo).
+        self.scan_counter_var = tk.StringVar(value="")
+        ttk.Label(
+            status_bar, textvariable=self.scan_counter_var, anchor="e",
+            font=("TkDefaultFont", 9, "bold"), foreground="#3a3f45",
+        ).pack(side="right", padx=(0, 8))
 
-        # INTERFACCIA «PAGINA WEB»: un unico contenitore verticale SCORREVOLE.
-        # Tutte le zone sono impilate dall'alto in basso; una scrollbar sempre
-        # visibile a destra consente di raggiungere qualunque elemento anche
-        # a finestra ridimensionata o con più card aperte.
-        page_wrap = ttk.Frame(main)
-        page_wrap.pack(fill="both", expand=True)
-        page_canvas = tk.Canvas(page_wrap, highlightthickness=0)
-        page_vbar = ttk.Scrollbar(page_wrap, orient="vertical", command=page_canvas.yview)
-        page_canvas.configure(yscrollcommand=page_vbar.set)
-        page_vbar.pack(side="right", fill="y")
-        page_canvas.pack(side="left", fill="both", expand=True)
-        self._page_canvas = page_canvas
-        page_inner = ttk.Frame(page_canvas)
-        self._page_inner = page_inner
-        page_canvas.create_window((0, 0), window=page_inner, anchor="nw")
-        page_inner.bind(
-            "<Configure>",
-            lambda _e: page_canvas.configure(scrollregion=page_canvas.bbox("all")),
-        )
-        page_canvas.bind(
-            "<Configure>",
-            lambda e: page_canvas.itemconfigure("all", width=e.width),
-        )
-        # FIX ROTELLA: bind_all — i widget figli ingoiavano l'evento e la
-        # pagina non scrollava mai. Ora la rotella scrolla la PAGINA ovunque,
-        # tranne sopra i widget con scroll proprio (Text con yscrollcommand,
-        # Treeview), dove muove il loro scroll interno.
-        def _page_wheel(event: Any) -> str:  # noqa: ANN401
-            w = event.widget
-            try:
-                wname = str(w)
-            except Exception:
-                wname = ""
-            # scroll interno per i Text (tranne il log: ha la pagina subito
-            # sopra, meglio scrollare la pagina) e per il Treeview
-            is_text = wname.endswith("text") or isinstance(w, tk.Text)
-            is_log = "log" in wname.lower()
-            if isinstance(w, tk.Text) and not is_log:
-                delta = getattr(event, "delta", 0)
-                step = -1 if (delta > 0 or getattr(event, "num", 0) == 4) else 1
-                w.yview_scroll(step * 2, "units")
-                return "break"
-            if isinstance(w, ttk.Treeview):
-                delta = getattr(event, "delta", 0)
-                step = -1 if (delta > 0 or getattr(event, "num", 0) == 4) else 1
-                w.yview_scroll(step * 2, "units")
-                return "break"
-            delta = getattr(event, "delta", 0)
-            step = -1 if (delta > 0 or getattr(event, "num", 0) == 4) else 1
-            page_canvas.yview_scroll(step * 3, "units")
-            return "break"
-        self.root.bind_all("<MouseWheel>", _page_wheel, add="+")
-        self.root.bind_all("<Button-4>", _page_wheel, add="+")
-        self.root.bind_all("<Button-5>", _page_wheel, add="+")
+        # ---------------- FASCIA C: TABELLA (sx) | ANTEPRIMA (dx) ----------------
+        body = ttk.Frame(main)
+        body.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
+        # UI v4 (richiesta utente): IMMAGINE A SINISTRA e prevalente (60%),
+        # tabella file a destra (40%).
+        body.grid_columnconfigure(0, weight=3)  # sinistra: anteprima PREVALENTE
+        body.grid_columnconfigure(1, weight=2)  # destra: tabella+frequenze
+        body.grid_rowconfigure(0, weight=1)
 
-        # -- ZONA 3: LOG IN ALTO — visibile durante le fasi senza scorrere
-        log_frame = ttk.LabelFrame(page_inner, text="Log", padding=4)
-        log_frame.pack(fill="x", pady=(0, 8))
-        self.log_text = tk.Text(log_frame, height=6, state="disabled", wrap="word")
-        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scroll.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        log_scroll.pack(side="right", fill="y")
-        self._log_frame = log_frame
+        # -- C-destra (UI v4): tabella file (scroll interna) + frequenze
+        left_col = ttk.Frame(body)
+        left_col.grid(row=0, column=1, sticky="nsew")
+        # Mockup v4 + chiarimento utente: la TABELLA è più ristretta in
+        # verticale e le frequenze continuano DIRETTAMENTE sotto, in continuo,
+        # con ALTEZZA FISSA di 8 righe sempre visibili senza scroll.
+        left_col.grid_rowconfigure(0, weight=1)
+        left_col.grid_rowconfigure(1, weight=1)  # UI v6: metà per le frequenze
+        left_col.grid_columnconfigure(0, weight=1)
 
-        # FASCIA 3: due metà affiancate — tabella file (sx, ~2/3) | frequenze (dx, ~1/3)
-        mid_band = ttk.Frame(page_inner)
-        mid_band.pack(fill="x", pady=(0, 8))
-        # -- ZONA 4: tabella risultati (altezza fissa; la sua scroll interna
-        #    gestisce molte righe)
-        tree_frame = ttk.Frame(mid_band)
-        tree_frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        tree_frame = ttk.Frame(left_col)
+        tree_frame.grid(row=0, column=0, sticky="nsew")
+        # UI v5: NIENTE colonna miniatura — un PhotoImage passato tra i
+        # values veniva stampato come testo «pyimage(n)» in ogni riga.
         self.results_tree = ttk.Treeview(
-            tree_frame, columns=("thumb", "file", "tema", "stato"), show="headings"
+            tree_frame, columns=("salv", "file", "tema", "stato"), show="headings"
         )
-        self.results_tree.heading("thumb", text="")
+        self.results_tree.heading("salv", text=" ✔")
         self.results_tree.heading("file", text="File")
         self.results_tree.heading("tema", text="Tema / Cartella")
         self.results_tree.heading("stato", text="Stato")
-        self.results_tree.column("thumb", width=THUMB_SIZE + 16, stretch=False, anchor="center")
-        self.results_tree.column("file", width=250)
-        self.results_tree.column("tema", width=170)
+        self.results_tree.column("salv", width=34, stretch=False, anchor="center")
+        self.results_tree.column("file", width=280)
+        self.results_tree.column("tema", width=190)
         self.results_tree.column("stato", width=70, anchor="center", stretch=False)
         tree_scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.results_tree.yview)
         self.results_tree.configure(yscrollcommand=tree_scroll_y.set)
@@ -1433,14 +1600,19 @@ class ClassifierApp:
         tree_scroll_y.grid(row=0, column=1, sticky="ns")
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
-        tree_frame.configure(height=160)
-        tree_frame.pack_propagate(False)  # altezza fissa, scroll interna
-        # -- Pannello frequenze parole (a destra della tabella, ~1/3):
-        #    parole più frequenti dell'immagine selezionata (o del gruppo).
-        self.freq_frame = ttk.LabelFrame(mid_band, text="Frequenze parole", padding=6)
-        self.freq_frame.pack(side="left", fill="both", expand=True)  # metà larghezza
+
+        # UI v6 (richiesta utente): niente finestra esterna (era
+        # seminascosta sotto il bordo) — il pulsante «📊 Frequenze» DIMEZZA
+        # la tabella e le frequenze compaiono nella metà inferiore della
+        # STESSA colonna destra.
+        self.freq_frame = ttk.Frame(left_col)
+        self.freq_frame.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+        self.freq_frame.grid_remove()  # nascosto: la tabella prende tutto
+        ttk.Label(
+            self.freq_frame, text="Frequenze parole", font=("TkDefaultFont", 9, "bold")
+        ).pack(anchor="w")
         self.freq_text = tk.Text(
-            self.freq_frame, height=8, width=34, state="disabled", wrap="word",
+            self.freq_frame, height=9, state="disabled", wrap="none",
             font=("TkFixedFont", 9),
         )
         f_scroll = ttk.Scrollbar(self.freq_frame, orient="vertical", command=self.freq_text.yview)
@@ -1450,200 +1622,177 @@ class ClassifierApp:
         self.freq_text.tag_configure("head", font=("TkDefaultFont", 9, "bold"))
         self._bind_mouse_wheel(self.freq_text)
 
-        # -- NOTA: scorri per i comandi (prima della zona anteprima) — il
-        #    widget viene creato qui ma packato DOPO freq_frame, quindi il
-        #    codice freq_frame DEVE precedere. (vedi nota in fondo blocco)
-        #    NOTA TECNICA: l'ordine reale è definito dai pack, non dalla
-        #    creazione; la nota e work_frame usano pack(before=...)? NO:
-        #    semplicemente il blocco frequenze è stato spostato sopra.
-        ttk.Label(
-            page_inner,
-            text="↓  scorri per i comandi  (comandi normali + scansione avanzata sotto l'anteprima)",
-            foreground="#8a6d00",
-            font=("TkDefaultFont", 9, "bold"),
-        ).pack(fill="x", pady=(0, 2))
+        # -- C-sinistra: ANTEPRIMA PREVALENTE (UI v4: immagine a sinistra)
+        preview_card = ttk.LabelFrame(body, text="Anteprima", padding=6)
+        preview_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self._work_frame = preview_card
+        preview_card.grid_rowconfigure(1, weight=3)  # immagine: ~60% della colonna
+        preview_card.grid_rowconfigure(2, weight=2)  # zona D (testo/card): ~40%
 
-        # -- ZONA 5 LAVORO: due colonne affiancate — anteprima (sx) | testo (dx)
-        work_frame = ttk.LabelFrame(page_inner, text="Anteprima e testo", padding=6)
-        work_frame.pack(fill="x", pady=(0, 8))
-        self._work_frame = work_frame
-        preview_frame = ttk.Frame(work_frame)
-        preview_frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
-        self._preview_frame = preview_frame
-        ocr_side = ttk.LabelFrame(work_frame, text="Testo OCR", padding=4)
-        ocr_side.pack(side="left", fill="both", expand=True)
-        self._ocr_side = ocr_side
-
+        # UI v4: niente messaggi sopra l'immagine — nome file, gruppo e
+        # info di contesto vivono nella RIGA DI STATO B (display). Le due
+        # variabili restano (sono aggiornate da tutto il codice) ma non
+        # hanno più etichette qui: sopra l'immagine restano SOLO i pulsanti.
         self.preview_header_var = tk.StringVar(value="Seleziona un'immagine nella tabella…")
-        ttk.Label(
-            preview_frame,
-            textvariable=self.preview_header_var,
-            justify="left",
-            font=("TkDefaultFont", 9, "bold"),
-            wraplength=340,
-        ).pack(fill="x", pady=(0, 2))
-
-        # Riga di info sul GRUPPO (tema) selezionato: attiva su riga di gruppo
         self.preview_group_var = tk.StringVar(value="")
-        self.preview_group_label = ttk.Label(
-            preview_frame,
-            textvariable=self.preview_group_var,
-            justify="left",
-            wraplength=340,
-            foreground="#555555",
-        )
-        self.preview_group_label.pack(fill="x", pady=(0, 2))
 
-        # Pulsanti anteprima SEMPRE in cima al pannello (sopra l'immagine),
-        # disposti su DUE file per non uscire dal pannello se la finestra è
-        # stretta: file 1 = azioni sul testo, file 2 = azioni sul gruppo.
-        self.pv_btns = pv_btns = ttk.Frame(preview_frame)
-        pv_btns.pack(fill="x", pady=(0, 4))
+        # Pulsanti anteprima SEMPRE sopra l'immagine, su due file.
+        self.pv_btns = pv_btns = ttk.Frame(preview_card)
+        pv_btns.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         pv_row1 = ttk.Frame(pv_btns)
         pv_row1.pack(fill="x")
         self.btn_toggle_ocr = ttk.Button(
-            pv_row1, text="📄  Testo OCR", command=self._toggle_ocr_text
+            pv_row1, text="📄  Testo OCR", command=self._toggle_ocr_text, **_bs("second")
         )
         self.btn_toggle_ocr.pack(side="left", padx=(0, 4))
         self.btn_save_ocr = ttk.Button(
-            pv_row1, text="💾  Salva testo", command=self._save_ocr_text
+            pv_row1, text="💾  Salva testo", command=self._save_ocr_text, **_bs("salva")
         )
         self.btn_save_ocr.pack(side="left", padx=(0, 4))
         self.btn_add_text = ttk.Button(
-            pv_row1, text="✍️  Aggiungi testo…", command=self._add_manual_text
+            pv_row1, text="✍️  Aggiungi testo…", command=self._add_manual_text, **_bs("avanza")
         )
         self.btn_add_text.pack(side="left")
         self.btn_adv_ocr = ttk.Button(
-            pv_row1, text="🔬  Scansione avanzata…", command=self._open_adv_ocr_panel
+            pv_row1, text="🔬  Scansione avanzata…", command=self._open_adv_ocr_panel, **_bs("avanza")
         )
         self.btn_adv_ocr.pack(side="left", padx=(4, 0))
+        # UI v5: frequenze in FINESTRA (come il testo OCR), non in pannello fisso.
+        self.btn_freq_win = ttk.Button(
+            pv_row1, text="📊  Frequenze", command=self._toggle_freq_window, **_bs("second")
+        )
+        self.btn_freq_win.pack(side="left", padx=(4, 0))
         pv_row2 = ttk.Frame(pv_btns)
         pv_row2.pack(fill="x", pady=(4, 0))
         self.btn_rename_theme = ttk.Button(
             pv_row2,
             text="✏️  Cambia termine del GRUPPO…",
-            command=self._change_theme_name,
+            command=self._change_theme_name, **_bs("second"),
         )
         self.btn_rename_theme.pack(side="left")
         self.btn_rename_theme.config(state="disabled")
         self.btn_exclude_term = ttk.Button(
             pv_row2,
             text="🚫  Escludi termine…",
-            command=self._exclude_theme_term,
+            command=self._exclude_theme_term, **_bs("second"),
         )
         self.btn_exclude_term.pack(side="left", padx=(4, 0))
         self.btn_exclude_term.config(state="disabled")
         self.btn_assign_group = ttk.Button(
             pv_row2,
             text="➡️  Sposta nel gruppo…",
-            command=self._open_assign_panel,
+            command=self._open_assign_panel, **_bs("second"),
         )
         self.btn_assign_group.pack(side="left", padx=(4, 0))
         self.btn_assign_group.config(state="disabled")
+        # v6.9 (richiesta utente): cancellazione dei termini SPLITTATA da
+        # «Sposta nel gruppo» — la lista deve essere MINIMA (solo gruppi in
+        # tabella + creati a mano), mai il cumulo spurio del dizionario.
+        self.btn_delete_themes = ttk.Button(
+            pv_row2,
+            text="🗑  Cancella termini…",
+            command=self._open_delete_panel, **_bs("second"),
+        )
+        self.btn_delete_themes.pack(side="left", padx=(4, 0))
+        self.btn_delete_themes.config(state="disabled")
 
-        self.preview_image_label = ttk.Label(preview_frame, anchor="center")
-        self.preview_image_label.pack(fill="x", pady=(0, 6), after=pv_btns)
+        self.preview_image_label = ttk.Label(preview_card, anchor="center")
+        self.preview_image_label.grid(row=1, column=0, sticky="nsew", pady=(0, 2))
 
-        # Il testo OCR è nascosto di default: si mostra col pulsante «Testo OCR»
-        # (l'immagine viene nascosta per far posto al testo a tutta altezza).
+        # ---------------- FASCIA D: ZONA CONTESTUALE (una card per volta) ----
+        # Contenuto di default: testo OCR. Le card (Aggiungi testo, Scansione
+        # avanzata, Cambia termine, Sposta nel gruppo) si aprono AL POSTO del
+        # testo: una chiude le altre. La geometria di A/B/C non cambia MAI.
+        # UI v4: la zona contestuale vive DENTRO la colonna anteprima,
+        # SOTTO l'immagine: aprendo il testo l'immagine resta visibile in
+        # cima (ridotta), non sparisce e la geometria A/B non cambia.
+        zone = ttk.Frame(preview_card)
+        zone.grid(row=2, column=0, sticky="nsew", pady=(4, 0))
+        preview_card.grid_rowconfigure(2, weight=1)  # il testo prende il resto
+        # FIX v6.1: altezza MINIMA della zona D: con meno di 220 px l'elenco
+        # dei candidati (max_h 150) + i pulsanti non entrano e si collassa.
+        # FIX v6.2: niente minsize STATICO — riservava spazio alla riga
+        # della zona D anche quando è VUOTA (l'immagine partiva già
+        # rimpicciolita all'avvio). Il minimo 220 px viene impostato
+        # dinamicamente in _show_zone_d solo quando la zona è aperta.
+        self._zone_d = zone
+
         self._ocr_text_visible = False
         self._current_preview_doc: Doc | None = None
-        self.preview_text = tk.Text(ocr_side, height=10, width=40, state="disabled", wrap="word")
+        self.preview_text = tk.Text(zone, height=9, wrap="word", state="disabled")
         self.preview_text.tag_configure("term", background="#ffe08a")
         self.preview_text.tag_configure("fused", background="#ffe08a", foreground="#a03000")
         # UNA sola scrollbar per il testo OCR, creata qui e riusata ai toggle.
-        self._preview_scroll = ttk.Scrollbar(ocr_side, orient="vertical", command=self.preview_text.yview)
+        self._preview_scroll = ttk.Scrollbar(zone, orient="vertical", command=self.preview_text.yview)
         self.preview_text.configure(yscrollcommand=self._preview_scroll.set)
         self._bind_mouse_wheel(self.preview_text)
 
-        # Immagini segnaposto per la colonna miniature (trasparente e cornice grigia)
-        try:
-            self._thumb_full = tk.PhotoImage(width=THUMB_SIZE, height=THUMB_SIZE)
-            self._thumb_empty = tk.PhotoImage(width=THUMB_SIZE, height=THUMB_SIZE)
-            for y in range(THUMB_SIZE):
-                if y in (0, THUMB_SIZE - 1):
-                    for x in range(THUMB_SIZE):
-                        self._thumb_empty.put("#b8b8b8", (x, y))
-                else:
-                    self._thumb_empty.put("#b8b8b8", (0, y))
-                    self._thumb_empty.put("#b8b8b8", (THUMB_SIZE - 1, y))
-        except Exception:
-            self._thumb_full = None
-            self._thumb_empty = None
-        self._thumbs: dict[str, tk.PhotoImage] = {}
-        self._preview_photo: tk.PhotoImage | None = None
-
-        self.results_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
-        self.results_tree.bind("<Double-1>", self._open_full_preview)
-
-        # -- Editor INLINE del termine di gruppo (al posto della finestra popup):
-        #    appare sotto l'anteprima quando si preme «Cambia termine del GRUPPO».
-        self.rename_panel = ttk.LabelFrame(page_inner, text="Cambia termine del GRUPPO", padding=6)
+        # -- Editor INLINE del termine di gruppo (nella zona D):
+        self.rename_panel = ttk.LabelFrame(zone, text="Cambia termine del GRUPPO", padding=6)
         self._rename_theme: str | None = None
         self.rename_candidates_var = tk.StringVar(value="")
         self.rename_info_var = tk.StringVar(value="")
         ttk.Label(
             self.rename_panel,
             textvariable=self.rename_info_var,
-            wraplength=320,
+            wraplength=520,
             justify="left",
             font=("TkDefaultFont", 9, "bold"),
         ).pack(fill="x", pady=(0, 2))
-        self.rename_cands_frame = ttk.Frame(self.rename_panel)
-        self.rename_cands_frame.pack(fill="x")
-        self._rename_radio_var = tk.StringVar(value="")
+        # UI v6: i PULSANTI si impacchettano PER PRIMI dal basso (side
+        # "bottom") — Applica/Chiudi restano sempre visibili e interi anche
+        # con tanti candidati; l'elenco scorre nella parte centrale.
+        rename_actions = ttk.Frame(self.rename_panel)
+        rename_actions.pack(side="bottom", fill="x", pady=(2, 0))
+        ttk.Button(
+            rename_actions, text="✅ Applica", command=self._apply_inline_rename, **_bs("salva")
+        ).pack(side="left")
+        ttk.Button(
+            rename_actions, text="Chiudi", command=self._close_rename_panel, **_bs("chiudi")
+        ).pack(side="right")
         custom_row = ttk.Frame(self.rename_panel)
-        custom_row.pack(fill="x", pady=(6, 2))
+        custom_row.pack(side="bottom", fill="x", pady=(6, 2))
         ttk.Label(custom_row, text="Oppure nuovo:").pack(side="left")
         self.rename_custom_var = tk.StringVar(value="")
         ttk.Entry(custom_row, textvariable=self.rename_custom_var, width=18).pack(
             side="left", padx=(4, 6)
         )
-        rename_actions = ttk.Frame(self.rename_panel)
-        rename_actions.pack(fill="x", pady=(2, 0))
-        ttk.Button(
-            rename_actions, text="✅ Applica", command=self._apply_inline_rename
-        ).pack(side="left")
-        ttk.Button(
-            rename_actions, text="🚫 Escludi termine…", command=self._exclude_theme_term
-        ).pack(side="left", padx=(6, 0))
-        ttk.Button(
-            rename_actions, text="Chiudi", command=self._hide_rename_panel
-        ).pack(side="right")
+        # UI v5: elenco scrollabile (rotella compresa).
+        _ren_outer, self.rename_cands_frame = self._make_scrollable(self.rename_panel, max_h=150)
+        _ren_outer.pack(side="bottom", fill="both", expand=True)
+        self._rename_radio_var = tk.StringVar(value="")
         # Nascosto di default: si apre solo su richiesta.
 
-        # -- Pannello INLINE «Sposta nel gruppo» (richiesta utente: assegnare
-        #    manualmente un'immagine a uno dei gruppi dell'analisi, o a un
-        #    gruppo nuovo, quando il concetto base non è tra i candidati):
-        self.assign_panel = ttk.LabelFrame(page_inner, text="Sposta nel gruppo", padding=6)
+        # -- Pannello INLINE «Sposta nel gruppo» (nella zona D):
+        self.assign_panel = ttk.LabelFrame(zone, text="Sposta nel gruppo", padding=6)
         self._assign_doc: Doc | None = None
         self.assign_info_var = tk.StringVar(value="")
         ttk.Label(
             self.assign_panel,
             textvariable=self.assign_info_var,
-            wraplength=420,
+            wraplength=620,
             justify="left",
             font=("TkDefaultFont", 9, "bold"),
         ).pack(fill="x", pady=(0, 2))
-        self.assign_radios_frame = ttk.Frame(self.assign_panel)
-        self.assign_radios_frame.pack(fill="x")
-        # CHECKLIST (richiesta utente): spunta su 1 gruppo per assegnare,
-        # su N gruppi per cancellarli. Le variabili BooleanVar per gruppo
-        # vivono in _assign_checks (ricostruite a ogni apertura pannello).
-        self._assign_checks: dict[str, tk.BooleanVar] = {}
+        # v6.9 (richiesta utente): RADIO BUTTON — la destinazione è UNA sola
+        # (prima con due spunte arrivava il messaggio «puoi assegnare un
+        # solo gruppo»). Le colonne si calcolano sullo spazio reale.
+        self._assign_dest_var = tk.StringVar(value="")
+        # v6.9: temi creati A MANO (Cambia termine / Sposta → Nuovo gruppo):
+        # sono gli unici extra ammessi nella lista di cancellazione.
+        self._handmade_themes: set[str] = set()
+        # UI v6: pulsanti FISSATI IN BASSO (side "bottom", impacchettati per
+        # primi) — mai più tagliati a metà; l'elenco scorre sopra di loro.
         assign_actions = ttk.Frame(self.assign_panel)
-        assign_actions.pack(fill="x", pady=(2, 0))
+        assign_actions.pack(side="bottom", fill="x", pady=(2, 0))
         ttk.Button(
-            assign_actions, text="✅ Assegna", command=self._apply_assign
+            assign_actions, text="✅ Assegna", command=self._apply_assign, **_bs("salva")
         ).pack(side="left")
         ttk.Button(
-            assign_actions, text="🗑 Cancella gruppi", command=self._delete_checked_groups
-        ).pack(side="left", padx=(6, 0))
-        ttk.Button(
-            assign_actions, text="Annulla", command=self._hide_assign_panel
+            assign_actions, text="Annulla", command=self._close_assign_panel, **_bs("chiudi")
         ).pack(side="left", padx=(6, 0))
         assign_new_row = ttk.Frame(self.assign_panel)
-        assign_new_row.pack(fill="x", pady=(6, 2))
+        assign_new_row.pack(side="bottom", fill="x", pady=(6, 2))
         self._assign_new_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             assign_new_row,
@@ -1656,36 +1805,55 @@ class ClassifierApp:
             assign_new_row, textvariable=self.assign_new_name_var, width=22, state="disabled"
         )
         self.assign_new_entry.pack(side="left", padx=(4, 6))
+        _asg_outer, self.assign_radios_frame = self._make_scrollable(self.assign_panel, max_h=170)
+        _asg_outer.pack(side="bottom", fill="both", expand=True)
         # Nascosto di default.
 
-        # -- Editor INLINE del testo manuale (niente finestra popup): pulsanti
-        #    in cima, campo di testo grande sotto (mai fuori vista).
-        self.manual_panel = ttk.LabelFrame(page_inner, text="Aggiungi testo", padding=6)
+        # -- Pannello INLINE «Cancella termini» (zona D, v6.9): checklist
+        # SOLO dei gruppi in tabella + creati a mano — niente cumulo spurio.
+        self.delete_panel = ttk.LabelFrame(zone, text="Cancella termini", padding=6)
+        self.delete_info_var = tk.StringVar(value="")
+        ttk.Label(
+            self.delete_panel,
+            textvariable=self.delete_info_var,
+            wraplength=620,
+            justify="left",
+        ).pack(fill="x", pady=(0, 4))
+        delete_actions = ttk.Frame(self.delete_panel)
+        delete_actions.pack(side="bottom", fill="x", pady=(2, 0))
+        ttk.Button(
+            delete_actions, text="🗑 Cancella selezionati", command=self._apply_delete_themes, **_bs("stop")
+        ).pack(side="left")
+        ttk.Button(
+            delete_actions, text="Annulla", command=self._close_delete_panel, **_bs("chiudi")
+        ).pack(side="left", padx=(6, 0))
+        _del_outer, self.delete_checks_frame = self._make_scrollable(self.delete_panel, max_h=170)
+        _del_outer.pack(side="bottom", fill="both", expand=True)
+        self._delete_checks: dict[str, tk.BooleanVar] = {}
+
+        # -- Editor INLINE del testo manuale (nella zona D):
+        self.manual_panel = ttk.LabelFrame(zone, text="Aggiungi testo", padding=6)
         self._manual_doc: Doc | None = None
         self.manual_info_var = tk.StringVar(value="")
         man_btns = ttk.Frame(self.manual_panel)
         man_btns.pack(fill="x", pady=(0, 4))
         ttk.Label(
-            man_btns, textvariable=self.manual_info_var, wraplength=320, justify="left"
+            man_btns, textvariable=self.manual_info_var, wraplength=420, justify="left"
         ).pack(side="left")
         ttk.Button(
-            man_btns, text="✅ Salva e accoda", command=self._save_manual_text
+            man_btns, text="✅ Salva e accoda", command=self._save_manual_text, **_bs("salva")
         ).pack(side="right")
         ttk.Button(
-            man_btns, text="Annulla", command=self._hide_manual_panel
+            man_btns, text="Annulla", command=self._close_manual_panel, **_bs("chiudi")
         ).pack(side="right", padx=(0, 6))
         self.manual_text = tk.Text(
-            self.manual_panel, height=8, width=40, wrap="word", font=("TkFixedFont", 10)
+            self.manual_panel, height=7, width=60, wrap="word", font=("TkFixedFont", 10)
         )
         ttk.Button(
             man_btns,
             text="↔️  Separa parole unite",
-            command=self._segment_manual_text,
+            command=self._segment_manual_text, **_bs("second"),
         ).pack(side="right", padx=(0, 6))
-        # Riga delle PAROLE DI SFONDO (richiesta utente): Google Lens a volte
-        # inserisce nel testo le parole ripetute sullo sfondo della foto.
-        # Scrivile qui (separate da spazio o virgola) e premi «🧹 Rimuovi»:
-        # vengono eliminate dal testo (parole intere, senza distinzione MAIUSCOLE).
         man_noise_row = ttk.Frame(self.manual_panel)
         man_noise_row.pack(fill="x", pady=(2, 0))
         ttk.Label(man_noise_row, text="Parole di sfondo da rimuovere:").pack(side="left")
@@ -1694,11 +1862,8 @@ class ClassifierApp:
             side="left", fill="x", expand=True, padx=6
         )
         ttk.Button(
-            man_noise_row, text="🧹 Rimuovi dal testo", command=self._remove_noise_words
+            man_noise_row, text="🧹 Rimuovi dal testo", command=self._remove_noise_words, **_bs("second")
         ).pack(side="left")
-        # Riga CERCA E SOSTITUISCI manuale (richiesta utente): i frammenti di
-        # sfondo variano con l'OCR (drink, ink, nk...) — l'utente li corregge
-        # a mano, N volte di seguito (i campi restano compilati).
         man_repl_row = ttk.Frame(self.manual_panel)
         man_repl_row.pack(fill="x", pady=(2, 0))
         ttk.Label(man_repl_row, text="Cerca:").pack(side="left")
@@ -1712,7 +1877,7 @@ class ClassifierApp:
             side="left", fill="x", expand=True, padx=(4, 6)
         )
         ttk.Button(
-            man_repl_row, text="🔄 Sostituisci", command=self._replace_in_manual_text
+            man_repl_row, text="🔄 Sostituisci", command=self._replace_in_manual_text, **_bs("second")
         ).pack(side="left")
         man_scroll = ttk.Scrollbar(
             self.manual_panel, orient="vertical", command=self.manual_text.yview
@@ -1722,38 +1887,28 @@ class ClassifierApp:
         man_scroll.pack(side="right", fill="y")
         self._bind_mouse_wheel(self.manual_text)
 
-        # -- Pannello INLINE «Scansione avanzata»: interfaccia Tesseract con
-        #    caselle di spunta. Prova varie combinazioni e mostra la classifica.
-        self.adv_panel = ttk.LabelFrame(page_inner, text="Scansione avanzata Tesseract", padding=6)
+        # -- Pannello INLINE «Scansione avanzata» (nella zona D):
+        self.adv_panel = ttk.LabelFrame(zone, text="Scansione avanzata Tesseract", padding=6)
         self._adv_doc: Doc | None = None
-        # RIGA 1: pulsanti + Applica + radio (SEMPRE in cima alla card, sopra
-        # immagine e risultati: mai fuori vista — regola pulsanti-in-cima)
         adv_btns = ttk.Frame(self.adv_panel)
         adv_btns.pack(fill="x", pady=(0, 4))
         self._adv_info_var = tk.StringVar(value="")
-        # FIX sdoppiamento riga pulsanti: l'etichetta ha ALTEZZA FISSA di 2
-        # righe. Prima il wraplength faceva variare la sua altezza a seconda
-        # del testo (1 o 2 righe) e la riga «Prova combinazioni / Ripeti /
-        # Applica» sottostante si spostava verticalmente — su Windows il
-        # ridisegno parziale la faceva apparire sdoppiata (1,5 riga).
-        # tk.Label (non ttk) perché supporta l'opzione height in righe.
+        # Info a ALTEZZA FISSA di 2 righe: evita lo sdoppiamento Windows della
+        # riga pulsanti quando il testo varia (vedi PROGETTO_MEMORIA.md).
         tk.Label(
-            adv_btns, textvariable=self._adv_info_var, wraplength=520,
+            adv_btns, textvariable=self._adv_info_var, wraplength=640,
             justify="left", height=2, anchor="nw",
         ).pack(side="top", fill="x")
         adv_btns_row = ttk.Frame(adv_btns)
         adv_btns_row.pack(side="top", fill="x")
-        ttk.Button(adv_btns_row, text="▶️ Prova combinazioni", command=self._run_adv_ocr).pack(side="left")
+        ttk.Button(adv_btns_row, text="▶️ Prova combinazioni", command=self._run_adv_ocr, **_bs("avanza")).pack(side="left")
         ttk.Button(
-            adv_btns_row, text="🔁 Ripeti scansione base", command=self._repeat_base_scan
+            adv_btns_row, text="🔁 Ripeti scansione base", command=self._repeat_base_scan, **_bs("second")
         ).pack(side="left", padx=(6, 0))
-        # Un solo pulsante «Applica»: usa sempre il testo mostrato (il primo/
-        # migliore risultato). Niente radio di scelta — regola UI utente.
         ttk.Button(
-            adv_btns_row, text="✅ Applica", command=self._apply_adv_ocr_result
+            adv_btns_row, text="✅ Applica", command=self._apply_adv_ocr_result, **_bs("salva")
         ).pack(side="left", padx=(8, 0))
-        ttk.Button(adv_btns_row, text="Chiudi", command=self._hide_adv_ocr_panel).pack(side="right")
-        # RIGA 2: motore (PSM/OEM)
+        ttk.Button(adv_btns_row, text="Chiudi", command=self._hide_adv_ocr_panel, **_bs("chiudi")).pack(side="right")
         adv_opts1 = ttk.Frame(self.adv_panel)
         adv_opts1.pack(fill="x")
         self.adv_psm_var = tk.StringVar(value="3")
@@ -1766,7 +1921,6 @@ class ClassifierApp:
             f.pack(side="left", padx=(0, 10))
             ttk.Label(f, text=lbl).pack(side="left")
             ttk.Combobox(f, textvariable=var, values=vals, state="readonly", width=w).pack(side="left", padx=(2, 0))
-        # RIGA 3: pre-elaborazioni
         adv_opts2 = ttk.Frame(self.adv_panel)
         adv_opts2.pack(fill="x", pady=(2, 0))
         self.adv_border_var = tk.BooleanVar(value=False)
@@ -1778,11 +1932,355 @@ class ClassifierApp:
             ("sharpen", self.adv_sharp_var),
         ):
             ttk.Checkbutton(adv_opts2, text=lbl, variable=var).pack(side="left", padx=(0, 8))
-        # NIENTE immagine/testo propri: la Scansione avanzata RIUSA l'unica
-        # anteprima della zona di lavoro (immagine a sinistra, risultati nel
-        # testo OCR a destra). Regola: una sola anteprima, mai duplicata.
+        # Area risultati DENTRO la card: nella zona D il testo OCR e la card
+        # si escludono, quindi i risultati della scansione avanzata vanno qui.
+        self.adv_result_text = tk.Text(self.adv_panel, height=7, wrap="word", state="disabled")
+        adv_r_scroll = ttk.Scrollbar(self.adv_panel, orient="vertical", command=self.adv_result_text.yview)
+        self.adv_result_text.configure(yscrollcommand=adv_r_scroll.set)
+        self.adv_result_text.pack(side="left", fill="both", expand=True, pady=(4, 0))
+        adv_r_scroll.pack(side="right", fill="y", pady=(4, 0))
+        self._bind_mouse_wheel(self.adv_result_text)
 
-        self.btn_move.config(state="disabled")
+        # Registry dei widget che vivono nella zona D (per lo show/hide
+        # «una card per volta»).
+        self._zone_widgets: list[tk.Widget] = [
+            self.preview_text,
+            self._preview_scroll,
+            self.rename_panel,
+            self.assign_panel,
+            self.manual_panel,
+            self.adv_panel,
+            self.delete_panel,
+        ]
+        self._zone_d.grid_remove()  # all'avvio: tutta l'altezza all'immagine
+
+        # ---- CHECKBOX «GRUPPO GIÀ SISTEMATO» (richiesta utente): spunta
+        # sulla riga gruppo = escluso dai salvataggi successivi e dalla
+        # FASE 3. Persistente in D:\\dizionari\\gruppi_salvati.txt.
+        self._saved_groups: set[str] = load_saved_groups()
+        self._group_checks: dict[str, tk.BooleanVar] = {}
+        self._group_iids: dict[str, str] = {}
+        self.results_tree.bind("<Button-1>", self._on_tree_click, add="+")
+
+        self._preview_photo: tk.PhotoImage | None = None
+
+        self.results_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+        # UI v5 (richiesta utente): stato corretto dei pulsanti GIÀ ALL'AVVIO
+        # (prima restavano attivi finché un'azione non chiamava il refresh).
+        self._refresh_buttons()
+
+        # UI v5.1: anche per i pulsanti COLORATI il disattivo = bianco con
+        # testo grigio-scuro (coerente con le fasi, e il grigio pallido di
+        # ttkbootstrap non si confonde piu' con l'attivo).
+        _st = ttk.Style(self.root)
+        _DISABLED_MAP = {
+            "background": [
+                ("disabled", "#ffffff"),
+                ("pressed", "#1f2328"),
+                ("active", "#4a5057"),
+                ("!disabled", "#3a3f45"),
+            ],
+            "foreground": [
+                ("disabled", "#5a5f66"),
+                ("pressed", "#ffffff"),
+                ("active", "#ffffff"),
+                ("!disabled", "#ffffff"),
+            ],
+        }
+        _st.map("dark.TButton", **_DISABLED_MAP)
+        for _tok in ("primary", "success", "danger", "info"):
+            try:
+                _name = f"{_tok}.TButton"
+                _m = _st.map(_name) or {}
+                # NB: le voci della mappa hanno LUNGHEZZA VARIABILE —
+                # ('disabled', colore) ma anche ('pressed', '!disabled',
+                # colore): l'ultimo elemento è sempre il valore, i precedenti
+                # gli stati. Si filtra sullo stato «disabled» ESATTO
+                # ("!disabled" non contiene lo stato disattivo!).
+                _bg = [e for e in _m.get("background", []) if "disabled" not in e[:-1]]
+                _fg = [e for e in _m.get("foreground", []) if "disabled" not in e[:-1]]
+                _bg.insert(0, ("disabled", "#ffffff"))
+                _fg.insert(0, ("disabled", "#5a5f66"))
+                _st.map(_name, background=_bg, foreground=_fg)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _fit_columns(self, labels: list[str], avail_px: int, min_cols: int = 4, max_cols: int = 6) -> int:
+        """v6.9: quante colonne ci stanno davvero nello spazio del pannello?
+        Misura la voce più lunga col font reale: il filetto della sezione
+        arriva a metà finestra e dentro c'è spazio per 6 colonne — inutile
+        restare su 4 fisse (lasciava colonne d'aria)."""
+        try:
+            f = tkfont.nametofont("TkDefaultFont")
+            widest = max((f.measure(l) for l in labels), default=80) + 40  # + radio + padding
+            if avail_px <= 1:
+                return min_cols
+            cols = max(min_cols, min(max_cols, avail_px // max(widest, 1)))
+            return max(min_cols, cols)
+        except Exception:
+            return min_cols
+
+    def _make_scrollable(self, parent: tk.Widget, max_h: int = 170) -> tuple[ttk.Frame, ttk.Frame]:
+        """Contenitore con scroll verticale (rotella compresa): ritorna
+        (contenitore, frame_interno). L'altezza si adatta al contenuto fino
+        a max_h px: con elenchi lunghi i pulsanti restano sempre visibili."""
+        outer = ttk.Frame(parent)
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vs = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _sync(_e: Any = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(win, width=canvas.winfo_width())
+            # FIX v6.1: niente adattamento all'altezza misurata di outer —
+            # creava un CROLLO A SPIRALE (spazio insufficiente → widget
+            # tagliato → altezza misurata minore → canvas ancora più piccolo,
+            # fino a ~3 px: restavano visibili solo i pulsanti). L'altezza
+            # richiesta è fissa: se lo spazio manca, pack la TAGLIA ma la
+            # scrollbar continua a funzionare e i pulsanti restano visibili
+            # perché impacchettati per primi dal basso.
+            canvas.configure(height=min(inner.winfo_reqheight() + 2, max_h))
+
+        inner.bind("<Configure>", _sync)
+        canvas.bind("<Configure>", _sync)
+        canvas.configure(yscrollcommand=vs.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+
+        def _wheel(e: Any) -> str:  # noqa: ANN401
+            # Agisce solo col puntatore dentro QUESTO canvas (bind_all add="+",
+            # così non interferisce con la rotella della tabella/testo).
+            wx, wy = canvas.winfo_pointerxy()
+            cx, cy = canvas.winfo_rootx(), canvas.winfo_rooty()
+            inside = (
+                cx <= wx < cx + canvas.winfo_width()
+                and cy <= wy < cy + canvas.winfo_height()
+            )
+            if inside:
+                step = -1 if (getattr(e, "delta", 0) > 0 or getattr(e, "num", 0) == 4) else 1
+                canvas.yview_scroll(step * 3, "units")
+            return ""
+
+        canvas.bind_all("<MouseWheel>", _wheel, add="+")
+        canvas.bind_all("<Button-4>", _wheel, add="+")
+        canvas.bind_all("<Button-5>", _wheel, add="+")
+        return outer, inner
+
+    # -- Zona D: una card per volta -------------------------------------------
+
+    def _show_zone_d(self, widget: tk.Widget) -> None:
+        """Mostra UN SOLO widget nella zona contestuale D: nasconde il testo
+        OCR e le altre card. La geometria di A/B/C resta immutata."""
+        for w in self._zone_widgets:
+            try:
+                if w.winfo_manager():
+                    w.pack_forget()
+            except Exception:  # noqa: BLE001
+                pass
+        if widget is None:
+            self._zone_d.grid_remove()  # UI v4: tutta l'altezza all'immagine
+            # FIX v6.2: minimo a zero — nessuno spazio riservato a zona vuota.
+            self._zone_d.master.grid_rowconfigure(2, minsize=0)
+            return
+        self._zone_d.grid()
+        # FIX v6.2: con la zona APERTA l'elenco dei candidati (max_h 150)
+        # + i pulsanti devono entrare: minimo 220 px per la riga.
+        self._zone_d.master.grid_rowconfigure(2, minsize=220)
+        if widget is self.preview_text:
+            widget.pack(side="left", fill="both", expand=True)
+            self._preview_scroll.pack(side="right", fill="y")
+        else:
+            # UI v6: le card riempiono l'altezza della zona — i pulsanti
+            # fissati in basso stanno davvero al FONDO, sempre visibili.
+            widget.pack(fill="both", expand=True)
+
+    def _zone_show_text(self) -> None:
+        """Riporta la zona D al contenuto di default (testo OCR se c'è un
+        documento selezionato, vuota altrimenti)."""
+        if self._current_preview_doc is not None:
+            self._set_ocr_text_visible(True)
+        else:
+            self._set_ocr_text_visible(False)
+
+    def _close_manual_panel(self) -> None:
+        self._hide_manual_panel()
+        self._zone_show_text()
+
+    def _close_rename_panel(self) -> None:
+        self._hide_rename_panel()
+        self._zone_show_text()
+
+    def _close_assign_panel(self) -> None:
+        self._hide_assign_panel()
+        self._zone_show_text()
+
+    # -- Cancella termini (v6.9) -------------------------------------------
+
+    def _open_delete_panel(self) -> None:
+        """Checklist MINIMA dei termini cancellabili: SOLO i gruppi presenti
+        in tabella + quelli creati a mano (Cambia termine/Sposta/Nuovo).
+        I termini spurii del dizionario temi.txt NON compaiono qui."""
+        themes_in_table = sorted({r.primary_topic for r in self.state.results})
+        handmade = getattr(self, "_handmade_themes", set())
+        groups = sorted(set(themes_in_table) | (handmade & set(load_known_themes())))
+        if not groups:
+            messagebox.showinfo("Cancella termini", "Nessun termine cancellabile (nessun gruppo in tabella).")
+            return
+        self.delete_info_var.set(
+            f"TERMINI CANCELLABILI: {len(groups)} (solo gruppi in tabella e creati a mano). "
+            "Riassegna le immagini PRIMA di cancellare un gruppo pieno."
+        )
+        for w in self.delete_checks_frame.winfo_children():
+            w.destroy()
+        self._delete_checks = {}
+        labels = ["📁 senza testo" if g == "senza testo" else f"📁 {g}" for g in groups]
+        cols = self._fit_columns(labels, self.delete_panel.winfo_width())
+        rows = (len(groups) + cols - 1) // cols or 1
+        for idx, (g, lab) in enumerate(zip(groups, labels)):
+            var = tk.BooleanVar(value=False)
+            self._delete_checks[g] = var
+            ttk.Checkbutton(
+                self.delete_checks_frame,
+                text=lab,
+                variable=var,
+            ).grid(row=idx % rows, column=idx // rows, sticky="w", padx=(0, 10), pady=1)
+        self._show_zone_d(self.delete_panel)
+
+    def _apply_delete_themes(self) -> None:
+        """Cancella i termini spuntati: toglie dal dizionario temi.txt e
+        (se il gruppo è vuoto) dalla tabella. Il gruppo dell'immagine
+        selezionata non è cancellabile — spostala prima."""
+        checked = [g for g, v in self._delete_checks.items() if v.get()]
+        if not checked:
+            messagebox.showinfo("Cancella termini", "Spunta prima i termini da cancellare.")
+            return
+        doc, cur_theme = self._selected_doc_and_theme()
+        removed, blocked = [], []
+        for g in checked:
+            n = sum(1 for r in self.state.results if r.primary_topic == g)
+            if n > 0 or g == cur_theme:
+                blocked.append((g, n))
+                continue
+            known = load_known_themes()
+            if g in known:
+                save_known_themes([t for t in known if t != g])
+            self.state.themes = [t for t in self.state.themes if t.name != g]
+            removed.append(g)
+            self._log(f"🗑 Termine «{g}» cancellato (dizionario + tabella).")
+        if blocked:
+            msg = "\n".join(f"   • {g} ({n} immagini)" for g, n in blocked)
+            messagebox.showwarning(
+                "Gruppi non cancellabili",
+                "Questi gruppi hanno ancora immagini in tabella:\n" + msg
+                + "\n\nRiassegnale PRIMA, poi cancella il termine.",
+            )
+        if removed:
+            for t in self.state.themes:
+                t.doc_count = sum(1 for r in self.state.results if r.primary_topic == t.name)
+            self._fill_results_tree(select_theme=cur_theme)
+            self._log(f"✅ Cancellati {len(removed)} termini dal dizionario.")
+        for v in self._delete_checks.values():
+            v.set(False)
+        self._close_delete_panel()
+
+    def _close_delete_panel(self) -> None:
+        self.delete_panel.pack_forget()
+        self._zone_show_text()
+
+    def _cleanup_spurious_themes(self) -> None:
+        """v6.9 (scelta utente: pulizia una tantum): finestra con TUTTI i
+        termini di temi.txt come checklist — pre-spuntati quelli NON in
+        tabella e NON creati a mano (i candidati spurii). «Pulisci" riscrive
+        il dizionario senza le voci selezionate."""
+        known = load_known_themes()
+        if not known:
+            messagebox.showinfo("Pulizia temi", "Il dizionario temi.txt è vuoto.")
+            return
+        keep_safe = {r.primary_topic for r in self.state.results} | getattr(
+            self, "_handmade_themes", set()
+        )
+        win = tk.Toplevel(self.root)
+        win.title("Pulizia temi spurii — una tantum")
+        win.geometry("460x420")
+        ttk.Label(
+            win,
+            text=("Spunta i termini da RIMUOVERE da temi.txt.\n"
+                  "Pre-spuntati quelli mai in tabella (spurii).\n"
+                  "Non spuntabili: gruppi correnti e creati a mano."),
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=8)
+        canvas = tk.Canvas(frame, highlightthickness=0)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind(
+            "<Configure>",
+            lambda _e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        # Rotella del mouse
+        canvas.bind_all(
+            "<MouseWheel>",
+            lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"),
+        )
+        vars_: dict[str, tk.BooleanVar] = {}
+        for t in known:
+            safe = t in keep_safe
+            var = tk.BooleanVar(value=not safe)
+            vars_[t] = var
+            cb = ttk.Checkbutton(
+                inner, text=("🔒 " + t) if safe else t, variable=var
+            )
+            if safe:
+                cb.state(["disabled"])
+            cb.pack(anchor="w", pady=1)
+
+        def do_clean() -> None:
+            to_remove = [t for t, v in vars_.items() if v.get()]
+            if not to_remove:
+                win.destroy()
+                return
+            kept = [t for t in known if t not in to_remove]
+            save_known_themes(kept)
+            self._log(
+                f"🧹 Pulizia dizionario: rimossi {len(to_remove)} termini spurii "
+                f"({', '.join(to_remove[:8])}{'…' if len(to_remove) > 8 else ""})."
+            )
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=8, pady=8)
+        ttk.Button(btns, text="🧹 Pulisci", command=do_clean, **_bs("stop")).pack(side="left")
+        ttk.Button(btns, text="Annulla", command=win.destroy, **_bs("chiudi")).pack(
+            side="left", padx=(6, 0)
+        )
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+    def _open_text_file(self, path: Path) -> None:
+        """Apre un file di testo con l'editor predefinito di sistema."""
+        try:
+            os.startfile(str(path))  # type: ignore[attr-defined]  # solo Windows
+        except Exception:  # noqa: BLE001
+            self._log(f"Impossibile aprire: {path}")
+
+    def _open_log_file(self) -> None:
+        """Apre log_app.txt (nella cartella input o accanto all'app)."""
+        base = self.state.input_dir or Path(__file__).resolve().parent
+        self._open_text_file(base / "log_app.txt")
+
+    def _stop_scan(self) -> None:
+        """STOP della FASE 1 (richiesta utente): interrompe l'accodamento
+        delle scansioni; le 2 immagini in corso finiscono (1-2 s), quelle in
+        coda vengono annullate. I risultati già pronti restano validi."""
+        self._stop_event.set()
+        self.btn_stop.config(state="disabled")
+        self._log("⏹  STOP richiesto: la scansione si ferma tra pochi secondi…")
 
     def _browse_input(self) -> None:
         d = filedialog.askdirectory(title="Seleziona la cartella con le immagini")
@@ -1796,6 +2294,8 @@ class ClassifierApp:
             self.output_var.set(d)
             # Il pulsante 3️⃣ dipende dal campo output: aggiorna subito lo stato.
             self._refresh_buttons()
+            # v6.7: l'indicatore cartelle segue la cartella scelta.
+            self._update_progress(3)
 
     def _available_langs(self) -> list[str]:
         """Lingue OCR disponibili: chiede a Tesseract («auto» sempre in cima).
@@ -1821,7 +2321,6 @@ class ClassifierApp:
     def _reset_results(self) -> None:
         self.state = AppState()
         self.results_tree.delete(*self.results_tree.get_children())
-        self._thumbs.clear()
         self._clear_preview()
         self.btn_move.config(state="disabled")
 
@@ -1832,23 +2331,38 @@ class ClassifierApp:
         return _word_frequencies(text, top_n=top_n)
 
     def _show_word_frequencies(self) -> None:
-        """Esporta le frequenze delle parole di ogni immagine in un CSV."""
-        docs = [d for d in self.state.docs if d.text.strip()]
-        if not docs:
-            messagebox.showinfo("Frequenze parole", "Nessun testo estratto: esegui prima la FASE 1.")
+        """v6.7 (richiesta utente): esporta le frequenze PER GRUPPO — un tema
+        per riga con candidati e conteggi, cioè quello che usa l'analisi —
+        al posto delle parole di ogni singola immagine (poco utile: le
+        frequenze inline e i candidati in «Cambia termine» coprono già quel
+        bisogno). Su disco: gruppi_frequenze.csv nella cartella input."""
+        results = self.state.results
+        if not results:
+            messagebox.showinfo(
+                "Frequenze per gruppo",
+                "Nessuna classificazione: esegui prima FASE 1 + FASE 2.",
+            )
             return
 
-        rows: list[list[str]] = []
-        for d in docs:
-            for w, c in self._word_frequencies(d.text, top_n=50):
-                rows.append([d.path.name, w, str(c)])
-
-        target = (self.state.input_dir or Path.cwd()) / "word_frequencies.csv"
+        target = (self.state.input_dir or Path.cwd()) / "gruppi_frequenze.csv"
         try:
-            lines = ["file,parola,frequenza"]
-            lines += [f'"{f}","{w}",{c}' for f, w, c in rows]
+            lines = ["gruppo,immagini,termine,candidato,freq_candidato"]
+            for t in sorted(self.state.themes, key=lambda x: x.name.lower()):
+                members = [r for r in results if r.primary_topic == t.name]
+                if not members:
+                    continue
+                cands = t.candidates[:5] or [("", 0)]
+                for cand, df in cands:
+                    lines.append(
+                        f'"{t.name}",{len(members)},"{t.raw_term}","{cand}",{df}'
+                    )
+                # Le parole più frequenti DEL GRUPPO (tutti i testi insieme):
+                group_text = "\n".join(r.doc.text for r in members)
+                top = self._word_frequencies(group_text, top_n=10)
+                for w, c in top:
+                    lines.append(f'"{t.name}",{len(members)},"{t.raw_term}","{w}",{c}')
             target.write_text("\n".join(lines), encoding="utf-8")
-            self._log(f"📊 Frequenze salvate ({len(rows)} righe): {target}")
+            self._log(f"📊 Frequenze per gruppo salvate ({len(lines) - 1} righe): {target}")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Errore", f"Impossibile salvare il CSV:\n{exc}")
 
@@ -1862,37 +2376,94 @@ class ClassifierApp:
 
     # -- Utility thread / log ------------------------------------------------
 
+    def _set_status(self, message: str) -> None:
+        """UI v4: display di stato (riga B) — testo + contesto, una riga."""
+        self.status_var.set(message)
+
+    def _update_progress(self, which: int) -> None:
+        """v6.7: indicatori di progressione sotto i pulsanti 1️⃣ 2️⃣ 3️⃣.
+        1: file in scansione (fatti/totale); 2: temi trovati; 3: cartelle
+        generate finora nella cartella output."""
+        try:
+            if which == 1:
+                docs = self.state.docs
+                if docs:
+                    ok = sum(1 for d in docs if d.text.strip() or d.error)
+                    errs = sum(1 for d in docs if d.error)
+                    self._prog1_var.set(
+                        f"{len(docs)} file · {errs} err." if errs else f"{len(docs)} file pronti"
+                    )
+                else:
+                    self._prog1_var.set("—")
+            elif which == 2:
+                themes = [t for t in self.state.themes if t.name]
+                self._prog2_var.set(
+                    f"{len(themes)} temi" if themes else "—"
+                )
+            elif which == 3:
+                out = self.output_var.get().strip()
+                if out and Path(out).is_dir():
+                    n = sum(
+                        1 for p in Path(out).iterdir() if p.is_dir()
+                    )
+                    self._prog3_var.set(f"{n} cartelle completate")
+                else:
+                    self._prog3_var.set("—")
+        except Exception:
+            pass
+
+
     def _log(self, message: str) -> None:
         self.log_queue.put(message)
+        # DISPLAY (UI v4): l'ultimo messaggio finisce nella riga B (come
+        # richiesto: i messaggi vanno nello status, non sopra l'immagine).
+        try:
+            self.root.after(0, self._set_status, message)
+        except RuntimeError:
+            pass
+        # LOG SU FILE (piano UI v3): il log completo va in log_app.txt nella
+        # cartella input (o accanto all'app se la cartella non è ancora
+        # scelta) — fase di test. A video resta solo l'ultima riga importante.
+        try:
+            base = self.state.input_dir or Path(__file__).resolve().parent
+            with (base / "log_app.txt").open("a", encoding="utf-8") as fh:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                fh.write(f"[{ts}] {message}\n")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _flush_log(self) -> None:
-        """Svuota SUBITO la coda del log nel widget (richiesta utente: il Log
-        e la tabella devono aggiornarsi in sincronia — la coda normalmente
-        viene svuotata ogni 150 ms, con la tabella che invece è immediata)."""
+        """Svuota SUBITO la coda del log nella barra di stato (piano UI v3:
+        il log a video è 1 riga; il testo completo va in log_app.txt)."""
         try:
             while True:
                 msg = self.log_queue.get_nowait()
-                self.log_text.config(state="normal")
-                self.log_text.insert("end", msg + "\n")
-                self.log_text.config(state="disabled")
+                self.status_var.set(msg)
         except queue.Empty:
             pass
-        self.log_text.see("end")
 
     def _poll_log_queue(self) -> None:
+        """Svuota la coda del log: l'ULTIMO messaggio va nella barra di stato
+        (1 riga a video, piano UI v3); il testo completo è già su file."""
         try:
+            last = None
             while True:
-                msg = self.log_queue.get_nowait()
-                self.log_text.config(state="normal")
-                self.log_text.insert("end", msg + "\n")
-                self.log_text.see("end")
-                self.log_text.config(state="disabled")
+                last = self.log_queue.get_nowait()
         except queue.Empty:
             pass
+        if last is not None:
+            self.status_var.set(last)
         self.root.after(150, self._poll_log_queue)
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
+        # Il pulsante STOP è attivo SOLO durante la FASE 1 (finestra in cui
+        # la scansione è in corso); a fine fase torna disabilitato.
+        if not busy:
+            self._stop_event.clear()
+        self.btn_stop.config(
+            state="normal" if (busy and self._scan_stop_enabled) else "disabled"
+        )
         if busy:
             self.progress.start(12)
         else:
@@ -1906,47 +2477,17 @@ class ClassifierApp:
         self._refresh_buttons()
 
     def _freeze_view(self) -> float:
-        """Blocca la posizione di scroll della pagina (frazione Y corrente).
-
-        FIX grafica Windows: durante la Scansione avanzata il contenuto cambia
-        (log, testo anteprima, titolo card) e la canvas riscrollava da sola,
-        con righe di pulsanti che sembravano sdoppiarsi nel ridisegno.
-        Cattura la posizione ora e ripristinala con _restore_view() dopo ogni
-        aggiornamento: la vista resta FISSA allo stesso pixel verticale."""
-        try:
-            frac = self._page_canvas.yview()[0]
-        except Exception:
-            frac = 0.0
-        self._frozen_view_frac = frac
-        return frac
+        """Ora no-op: il nuovo layout non ha scroll di pagina (piano UI v3),
+        la vista non può più scorrere da sola. Resta per compatibilità."""
+        return 0.0
 
     def _restore_view(self) -> None:
-        """Riporta la pagina alla posizione bloccata da _freeze_view()."""
-        frac = getattr(self, "_frozen_view_frac", None)
-        if frac is None:
-            return
-        try:
-            self._page_canvas.update_idletasks()
-            self._page_canvas.yview_moveto(frac)
-        except Exception:
-            pass
+        """Ora no-op (piano UI v3: niente scroll di pagina)."""
+        return
 
     def _scroll_to(self, widget: tk.Widget) -> None:
-        """Porta la vista della pagina sul widget indicato (auto-scroll).""" 
-        canvas = self._page_canvas
-        try:
-            y = widget.winfo_rooty() - canvas.winfo_rooty() + canvas.yview()[0] * int(canvas.cget("height"))
-            # calcolo semplice: frazione = y_assoluto_widget / altezza_contenuto
-            top = widget.winfo_rooty() - canvas.winfo_rooty()
-            total = widget.winfo_toplevel().winfo_height()
-            frac = max(0.0, top / max(1, canvas.winfo_height()))
-        except Exception:
-            return
-        canvas.update_idletasks()
-        try:
-            canvas.yview_moveto(frac)
-        except Exception:
-            pass
+        """Ora no-op (piano UI v3: niente scroll di pagina, tutto visibile)."""
+
 
     def _refresh_buttons(self) -> None:
         state = self.state
@@ -1968,13 +2509,18 @@ class ClassifierApp:
             if (not self.busy and has_results and self.output_var.get().strip())
             else "disabled"
         )
-        self.btn_freq.config(
+        # btn_freq (Esporta CSV) non esiste più: la voce è nel menu Extra,
+        # sempre attiva — la funzione stessa avvisa se mancano i dati.
+        self.btn_freq_win.config(
             state="normal" if (not self.busy and has_docs) else "disabled"
         )
         self.btn_rename_theme.config(
             state="normal" if (not self.busy and has_results) else "disabled"
         )
         self.btn_exclude_term.config(
+            state="normal" if (not self.busy and has_results) else "disabled"
+        )
+        self.btn_delete_themes.config(
             state="normal" if (not self.busy and has_results) else "disabled"
         )
         self.btn_assign_group.config(
@@ -1992,6 +2538,7 @@ class ClassifierApp:
 
         self._reset_results()
         self.state.input_dir = input_dir
+        self._scan_stop_enabled = True  # STOP attivo solo per la FASE 1
         self._set_busy(True)
         self._log(f"\n🚀 FASE 1 - Estrazione testo da immagini in: {input_dir}")
 
@@ -2017,23 +2564,45 @@ class ClassifierApp:
                         reused += 1
                 if reused:
                     self._log(f"   ♻️  {reused} immagini già in ocr_testi.txt: testo riusato (niente ri-scansione).")
+                self.root.after(
+                    0, self.scan_counter_var.set, f"🔬 {reused}/{len(files)}"
+                )
+                # v6.7: anche l'indicatore sotto 1️⃣ parte subito con il totale.
+                self.root.after(0, self._update_progress, 1)
 
                 from concurrent.futures import ThreadPoolExecutor, as_completed
 
                 done = 0
-                with ThreadPoolExecutor(max_workers=2) as pool:  # 2 concorrenti: CPU non saturata
-                    futures = {
-                        pool.submit(extract_text_from_image, f, tess_lang): f for f in to_scan
-                    }
+                self._stop_event.clear()
+                pool = ThreadPoolExecutor(max_workers=2)  # 2 concorrenti: CPU non saturata
+                scan_fn = extract_text_two_pass if lang == "auto" else extract_text_from_image
+                futures = {
+                    pool.submit(scan_fn, f) if lang == "auto" else pool.submit(extract_text_from_image, f, tess_lang): f
+                    for f in to_scan
+                }
+                try:
                     for fut in as_completed(futures):
+                        if self._stop_event.is_set():
+                            self._log(f"⏹  Scansione interrotta: {done}/{len(to_scan)} immagini elaborate su {len(to_scan)}.")
+                            break
                         f = futures[fut]
                         text, error, variant = fut.result()
                         self.state.docs.append(Doc(path=f, text=text, error=error))
                         if variant not in ("standard", "errore") and text:
                             self._log(f"   🛠 {f.name}: OCR riuscito con variante «{variant}»")
                         done += 1
+                        # UI v6: contatore accanto alla barra, ogni immagine.
+                        self.root.after(
+                            0,
+                            self.scan_counter_var.set,
+                            f"🔬 {done + reused}/{len(files)}",
+                        )
+                        # v6.7: l'indicatore sotto 1️⃣ segue la scansione.
+                        self.root.after(0, self._update_progress, 1)
                         if done % 5 == 0 or done == len(to_scan):
                             self._log(f"   … {done}/{len(to_scan)} elaborate")
+                finally:
+                    pool.shutdown(wait=False, cancel_futures=True)  # STOP: le in coda sono annullate
                 self.state.docs.sort(key=lambda d: d.path.name.lower())
                 # Correzione lessicale: usa i termini visti in tutte le
                 # immagini E il dizionario di apprendimento accumulato nelle
@@ -2077,7 +2646,6 @@ class ClassifierApp:
 
     def _after_extraction(self) -> None:
         self._set_busy(False)
-        self._scroll_to(self._log_frame)
         docs = self.state.docs
         ok = [d for d in docs if not d.error]
         failed = [d for d in docs if d.error]
@@ -2089,16 +2657,26 @@ class ClassifierApp:
             for d in failed[:10]:
                 self._log(f"   • {d.path.name}: {d.error}")
         self._refresh_buttons()
+        # v6.7: indicatori di progressione aggiornati a fine FASE 1.
+        self._update_progress(1)
+        self._update_progress(3)
         # FASE 2 AUTOMATICA (richiesta utente): se TUTTI i testi sono pronti
         # (nessuna immagine con errore da correggere a mano), si passa da
         # soli alla FASE 2. Se invece c'è lavoro manuale (scansione avanzata,
         # aggiungi testo…), si aspetta l'utente.
         if ok and not failed and len(ok) >= 2:
-            self._log("\n➡️  Tutti i testi pronti — passaggio automatico alla FASE 2…")
+            # v6.6 (richiesta utente): il passaggio automatico alla FASE 2
+            # va EVIDENZIATO — prima sfuggiva (la riga di stato lampeggiava
+            # e sembrava che il pulsante 2️⃣ si attivasse da solo).
+            self._auto_phase2 = True
+            self._log(
+                "\n⏩⏩  TUTTI i testi pronti: FASE 2 avviata AUTOMATICAMENTE "
+                "(nessuna immagine da correggere). Il pulsante 2 NON serve premerlo."
+            )
             self._run_classification()
             return
         if ok:
-            self._log("➡️  Ci sono immagini da correggere: finiscile, poi premi «2️⃣ Trova temi e classifica».")
+            self._log("➡️  Ci sono immagini da correggere: finiscile, poi premi «2 Trova temi e classifica».")
 
     # -- FASE 2: Classificazione ----------------------------------------------
 
@@ -2115,7 +2693,14 @@ class ClassifierApp:
         if self.state.results:
             self._log("\n🧠 FASE 2 - RICALCOLO dei gruppi (es. dopo «Aggiungi testo»)…")
         else:
-            self._log("\n🧠 FASE 2 - Analisi dei testi e individuazione dei temi…")
+            _auto = getattr(self, "_auto_phase2", False)
+            self._auto_phase2 = False
+            if _auto:
+                self._log(
+                    "\n🧠 FASE 2 (AUTOMATICA, dopo la 1) - Analisi dei testi e individuazione dei temi…"
+                )
+            else:
+                self._log("\n🧠 FASE 2 - Analisi dei testi e individuazione dei temi…")
 
         def worker() -> None:
             try:
@@ -2145,7 +2730,6 @@ class ClassifierApp:
 
     def _after_classification(self) -> None:
         self._set_busy(False)
-        self._scroll_to(self._log_frame)
         self._log("\n📌 Concetti base dell'intero corpus:")
         self._log(f"   {', '.join(self.state.top_terms) if self.state.top_terms else 'n/d'}")
 
@@ -2166,10 +2750,12 @@ class ClassifierApp:
         self._flush_log()  # log e tabella in sincronia
         self._fill_results_tree()
         self._refresh_buttons()
+        # v6.7: indicatore temi sotto il pulsante 2️⃣.
+        self._update_progress(2)
         if self.output_var.get().strip():
-            self._log("➡️  Ora premi «3️⃣ Sposta nelle cartelle».")
+            self._log("➡️  Ora premi «3 Sposta nelle cartelle».")
         else:
-            self._log("➡️  Seleziona la cartella output, poi premi «3️⃣ Sposta nelle cartelle».")
+            self._log("➡️  Seleziona la cartella output, poi premi «3 Sposta nelle cartelle».")
 
     def _stato_for_doc(self, doc: Doc, unclassified: bool = False) -> str:
         """Simbolo di stato nella colonna «Stato» della tabella file — SOLO DUE
@@ -2178,10 +2764,12 @@ class ClassifierApp:
           sessione) — l'immagine è "fatta"
         - ⬜ = non ancora inserita in ocr_testi.txt — c'è ancora da lavorarci
         (in caso di errore OCR il simbolo è ⚠, ma resta la logica dei due stati)"""
+        # v6.8 (richiesta utente): ⬜ era più largo di ✔ (16 vs 12 px sul
+        # suo sistema) e la colonna «ballava». ☐ ha la STESSA larghezza di ✔.
         saved = doc.path.name in self._saved_ocr_names()
         if doc.error:
             return "⚠"
-        return "✔" if saved else "⬜"
+        return "✔" if saved else "☐"
 
     def _fill_results_tree(self, select_theme: str | None = None) -> None:
         # Rileva la selezione attuale PRIMA di ricaricare, per ripristinarla dopo
@@ -2206,29 +2794,31 @@ class ClassifierApp:
             label = f"📁 {theme}"
             if info is not None and info.doc_count:
                 label += f"  ({info.doc_frequency}/{info.doc_count})"
-            g_iid = self.results_tree.insert("", "end", values=(self._thumb_full, label, "", ""))
+            chk = "☑" if theme in self._saved_groups else "☐"
+            if theme in self._saved_groups and label.endswith(")"):
+                label += "  ✔ da spostare"
+            g_iid = self.results_tree.insert("", "end", values=(chk, label, "", ""))
+            self._group_iids[theme] = g_iid
             if theme == select_theme or (select_theme is None and theme == prev_theme):
                 new_group_iid = g_iid
             for r in results:
                 stato = self._stato_for_doc(r.doc)
-                photo = self._thumb_for(r.doc.path)
                 c_iid = self.results_tree.insert(
-                    "", "end", values=(photo, r.doc.path.name, theme, stato)
+                    "", "end", values=("", r.doc.path.name, theme, stato)
                 )
                 if prev_doc is not None and theme == prev_theme and r.doc.path.name == prev_doc.path.name:
                     new_child_iid = c_iid
         if unclassified:
             label = f"📁 senza testo  ({len(unclassified)})"
-            u_iid = self.results_tree.insert("", "end", values=(self._thumb_full, label, "", ""))
+            u_iid = self.results_tree.insert("", "end", values=("", label, "", ""))
             if select_theme == "__senza_testo__" or (
                 select_theme is None and prev_theme == "senza testo"
             ):
                 new_group_iid = u_iid
             for d in unclassified:
                 stato = self._stato_for_doc(d, unclassified=True)
-                photo = self._thumb_for(d.path)
                 c_iid = self.results_tree.insert(
-                    "", "end", values=(photo, d.path.name, "senza testo", stato)
+                    "", "end", values=("", d.path.name, "senza testo", stato)
                 )
                 if prev_doc is not None and prev_doc.path.name == d.path.name:
                     new_child_iid = c_iid
@@ -2241,24 +2831,35 @@ class ClassifierApp:
 
     # -- Anteprima e selezione -------------------------------------------------
 
-    def _thumb_for(self, path: Path) -> tk.PhotoImage | None:
-        """Miniatura in cache per la colonna della tabella."""
-        cached = self._thumbs.get(path.name)
-        if cached is not None:
-            return cached
-        if self._thumb_empty is None:
-            return None
+    def _on_tree_click(self, event: Any) -> None:  # noqa: ANN401
+        """Click sulla COLONNA ✔ (riga gruppo): attiva/disattiva «sistemato»."""
         try:
-            from PIL import Image, ImageTk
+            iid = self.results_tree.identify_row(event.y)
+            col = self.results_tree.identify_column(event.x)
+        except tk.TclError:
+            return
+        if not iid or col != "#1":
+            return
+        values = self.results_tree.item(iid, "values")
+        if not values or len(values) < 2:
+            return
+        label = str(values[1])
+        if not label.startswith("📁"):
+            return  # la spunta vale solo sulle righe di GRUPPO
+        theme = re.sub(r"\s+✔\s*(?:sistemato|da spostare)$", "", label[1:].strip()).strip()
+        theme = re.sub(r"\s+\(\d+/\d+\)$", "", theme).strip()
+        if not theme:
+            return
+        if theme in self._saved_groups:
+            self._saved_groups.discard(theme)
+            remove_saved_group(theme)
+            self._log(f"☐ «{theme}» senza spunta: NON verrà spostato dal tasto 3.")
+        else:
+            self._saved_groups.add(theme)
+            add_saved_group(theme)
+            self._log(f"☑ «{theme}» SISTEMATO: verrà spostato dal tasto 3 (solo i gruppi spuntati).")
+        self._fill_results_tree()
 
-            with Image.open(path) as img:
-                img = img.convert("RGB")
-                img.thumbnail((THUMB_SIZE, THUMB_SIZE), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-        except Exception:  # noqa: BLE001
-            photo = self._thumb_empty
-        self._thumbs[path.name] = photo
-        return photo
 
     def _selected_doc_and_theme(self) -> tuple[Doc | None, str]:
         """Documento e tema della riga selezionata (None se è una riga di gruppo)."""
@@ -2269,7 +2870,7 @@ class ClassifierApp:
             values = self.results_tree.item(selected[0], "values")
         except tk.TclError:
             return None, ""  # selezione obsoleta (riga ricreata)
-        if not values or len(values) < 3:
+        if not values or len(values) < 2:
             return None, ""
         filename = str(values[1])
         theme = str(values[2])
@@ -2296,8 +2897,10 @@ class ClassifierApp:
             label = str(values[1])
             if label.startswith("📁 "):
                 name = label[2:].strip()
-                # toglie la copertura finale, es. "scontrino  (3/3)" -> "scontrino"
-                return re.sub(r"\s+\(\d+/\d+\)$", "", name)
+                # toglie il badge «sistemato» e poi la copertura finale,
+                # es. "what  (6/8)  ✔ sistemato" -> "what"
+                name = re.sub(r"\s+✔\s*sistemato$", "", name).strip()
+                return re.sub(r"\s+\(\d+/\d+\)$", "", name).strip()
         return None
 
     def _on_tree_select(self, event: Any = None) -> None:  # noqa: ANN401
@@ -2320,7 +2923,14 @@ class ClassifierApp:
                 info = self._theme_info(theme)
                 members = [r for r in self.state.results if r.primary_topic == theme]
                 if info is not None and members:
+                    # FIX v6.4: aggiorna ANCHE l'anteprima (immagine, stato,
+                    # testo, frequenze) sull'immagine cliccata — prima il
+                    # return anticipato la lasciava ferma sulla riga vecchia.
+                    if doc is not None:
+                        self._show_preview_panel(doc, theme)
                     self._show_rename_panel(theme, info)
+                    if doc is not None:
+                        self._render_preview_image(doc)
                     self._log(f"✏️ Editor termine ora sul GRUPPO «{theme}» ({info.doc_count} immagini).")
                     return
             # stesso gruppo o gruppo non rinominabile: non toccare il pannello
@@ -2328,7 +2938,12 @@ class ClassifierApp:
         # dell'editor termini): mostra sempre l'immagine appena cliccata.
         if getattr(self, "_assign_doc", None) is not None and self.assign_panel.winfo_manager():
             if doc is not None:
+                # FIX v6.4: anteprima aggiornata sull'immagine cliccata; la
+                # card Sposta resta aperta (riaperta subito dopo) e l'immagine
+                # viene ridisegnata sullo spazio residuo della zona D.
+                self._show_preview_panel(doc, theme)
                 self._open_assign_panel()
+                self._render_preview_image(doc)
                 return
         if doc is not None:
             self._show_preview_panel(doc, theme)
@@ -2348,9 +2963,28 @@ class ClassifierApp:
         widget.bind("<Button-4>", on_wheel)
         widget.bind("<Button-5>", on_wheel)
 
+    def _render_preview_image(self, doc: Doc) -> None:
+        """Mostra l'immagine nell'anteprima, ridimensionata allo SPAZIO REALE
+        disponibile (UI v5: prima veniva tagliata col testo aperto)."""
+        try:
+            from PIL import Image, ImageTk
+
+            with Image.open(doc.path) as img:
+                img = img.convert("RGB")
+                self.preview_image_label.update_idletasks()
+                w = max(240, self.preview_image_label.winfo_width() - 8)
+                h = max(200, self.preview_image_label.winfo_height() - 8)
+                img.thumbnail((w, h), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+            self.preview_image_label.config(image=photo, text="")
+            self._preview_photo = photo  # evita il garbage collection
+        except Exception as exc:  # noqa: BLE001
+            self.preview_image_label.config(image="", text=f"Immagine non leggibile:\n{exc}")
+
     def _clear_preview(self) -> None:
         self.preview_header_var.set("Seleziona un'immagine nella tabella…")
         self.preview_group_var.set("")
+        self._set_status("Seleziona un'immagine nella tabella…")
         self.preview_image_label.config(image="", text="")
         self._preview_photo = None
         self._current_preview_doc = None
@@ -2370,16 +3004,18 @@ class ClassifierApp:
         pack a ogni toggle creerebbe barre duplicate e non funzionanti.
         """
         self._ocr_text_visible = visible
-        # L'immagine RESTA visibile: il toggle agisce solo sulla colonna testo.
+        # Il testo vive nella ZONA D (piano UI v3): show/hide via _show_zone_d
+        # così una card alla volta e la geometria di A/B/C resta fissa.
         if visible:
-            if not self.preview_text.winfo_manager():
-                self.preview_text.pack(side="left", fill="both", expand=True)
-                self._preview_scroll.pack(side="right", fill="y")
+            self._show_zone_d(self.preview_text)
             self.btn_toggle_ocr.config(text="📄  Nascondi testo")
         else:
-            self.preview_text.pack_forget()
-            self._preview_scroll.pack_forget()
+            self._show_zone_d(None)
             self.btn_toggle_ocr.config(text="📄  Testo OCR")
+        # UI v5: l'immagine si RICALCOLA sullo spazio residuo dopo il cambio
+        # (con il testo aperto non viene più tagliata).
+        if self._current_preview_doc is not None:
+            self._render_preview_image(self._current_preview_doc)
 
     def _toggle_ocr_text(self) -> None:
         self._set_ocr_text_visible(not self._ocr_text_visible)
@@ -2426,8 +3062,7 @@ class ClassifierApp:
         # before=pv_btns: il primo widget sempre packed (l'etichetta immagine
         # viene unpackata col toggle «Testo OCR», e pack(before=...) su un
         # widget non packed solleva TclError — bug visto in produzione).
-        self.manual_panel.pack(fill="x", before=self._work_frame, pady=(0, 8))
-        self._set_ocr_text_visible(False)
+        self._show_zone_d(self.manual_panel)
 
     def _hide_manual_panel(self) -> None:
         self.manual_panel.pack_forget()
@@ -2467,13 +3102,10 @@ class ClassifierApp:
         # comandi della scansione (card opzioni). Una sola anteprima: i
         # risultati andranno nella colonna testo OCR della zona di lavoro.
         self.btn_adv_ocr.pack_forget()
-        self.adv_panel.pack(fill="x", before=self._work_frame, pady=(0, 8))
+        self._show_zone_d(self.adv_panel)
         self._hide_manual_panel()
         self._hide_rename_panel()
-        # Mostra la colonna testo: lì dentro scriveremo i risultati.
-        self._set_ocr_text_visible(True)
         self._adv_write_preview("Scegli le opzioni sopra, poi «▶️ Prova combinazioni».")
-        self._scroll_to(self._work_frame)
 
 
     def _hide_adv_ocr_panel(self) -> None:
@@ -2488,9 +3120,9 @@ class ClassifierApp:
                 self._current_preview_doc, self._theme_of_doc(self._current_preview_doc)
             )
         elif self._current_preview_doc is not None:
-            self._adv_write_preview(self._current_preview_doc.text or "(nessun testo OCR)")
+            self._zone_show_text()
         else:
-            self._set_ocr_text_visible(False)
+            self._zone_show_text()
 
     def _repeat_base_scan(self) -> None:
         """Ripete la lettura con gli STESSI parametri della scansione base
@@ -2534,13 +3166,13 @@ class ClassifierApp:
         self._restore_view()
 
     def _adv_write_preview(self, content: str) -> None:
-        """Scrive contenuto semplice (istruzioni o testo scansionato) nel testo
-        dell'UNICA anteprima, al posto del testo OCR."""
-        self.preview_text.config(state="normal")
-        self.preview_text.delete("1.0", "end")
-        self.preview_text.insert("end", content)
-        self.preview_text.config(state="disabled")
-        self.preview_text.yview_moveto(0.0)
+        """Scrive istruzioni/risultati nella card Scansione avanzata (zona D):
+        il testo OCR e la card si escludono, la card ha la sua area testo."""
+        self.adv_result_text.config(state="normal")
+        self.adv_result_text.delete("1.0", "end")
+        self.adv_result_text.insert("end", content)
+        self.adv_result_text.config(state="disabled")
+        self.adv_result_text.yview_moveto(0.0)
 
     def _run_adv_ocr(self) -> None:
         """Esegue UNA sola scansione con i parametri scelti dall'utente.
@@ -2602,11 +3234,7 @@ class ClassifierApp:
         # Il testo COMPLETO va nell'anteprima: l'utente deve poterlo giudicare
         # prima di applicare. Le informazioni di riepilogo stanno SOPRA, nella
         # riga di stato, fuori dalla finestra testo (regola utente).
-        self.preview_text.config(state="normal")
-        self.preview_text.delete("1.0", "end")
-        self.preview_text.insert("end", text if text else "(nessun testo riconosciuto)")
-        self.preview_text.config(state="disabled")
-        self.preview_text.yview_moveto(0.0)
+        self._adv_write_preview(text if text else "(nessun testo riconosciuto)")
         self._adv_info_var.set(
             f"Scansione completata: {score} parole riconosciute · {cmd}. "
             "Leggi il testo qui sotto e premi «✅ Applica» se va bene."
@@ -2893,35 +3521,55 @@ class ClassifierApp:
         return _word_frequencies(text, top_n=top_n)
 
     def _fill_freq_panel(self, heading: str, freqs: list[tuple[str, int]], total_label: str) -> None:
-        """Popola il pannello frequenze a destra dell'anteprima."""
+        """Popola il pannello frequenze in continuo sotto la tabella.
+
+        Intestazione compatta su UNA riga (titolo + totale): le righe
+        successive sono tutte parole — con Text height=9 restano sempre
+        8 parole visibili senza scroll (richiesta utente).
+        """
         self.freq_text.config(state="normal")
         self.freq_text.delete("1.0", "end")
-        self.freq_text.insert("end", heading + "\n", "head")
-        self.freq_text.insert("end", total_label + "\n\n")
+        self.freq_text.insert("end", f"{heading}   ·   {total_label}\n", "head")
         if not freqs:
             self.freq_text.insert("end", "(nessuna parola significativa)\n")
         else:
             max_c = freqs[0][1] or 1
-            for w, c in freqs:
+            for w, c in freqs[:8]:
                 bar = "█" * max(1, round(16 * c / max_c))
                 self.freq_text.insert("end", f"{w:<18}{c:>4}  {bar}\n")
         self.freq_text.config(state="disabled")
+
+    def _toggle_freq_window(self) -> None:
+        """UI v6: mostra/nasconde le frequenze nella metà inferiore della
+        colonna della tabella (la tabella si dimezza). Niente finestre
+        esterne: tutto dentro la finestra principale."""
+        if not self.freq_frame.winfo_manager():
+            self.freq_frame.grid()
+            self.btn_freq_win.config(text="📊  Nascondi frequenze")
+        else:
+            self._hide_freq_window()
+
+    def _hide_freq_window(self) -> None:
+        self.freq_frame.grid_remove()
+        self.btn_freq_win.config(text="📊  Frequenze")
 
     def _theme_info(self, theme: str) -> ThemeInfo | None:
         return next((t for t in self.state.themes if t.name == theme), None)
 
     def _show_group_panel(self, theme: str) -> None:
         """Riga di gruppo selezionata: riepilogo del GRUPPO e candidati."""
+        self._show_zone_d(self.preview_text)
+        self._ocr_text_visible = True
+        self.btn_toggle_ocr.config(text="📄  Nascondi testo")
         self.preview_header_var.set(f"GRUPPO: 📁 {theme}")
         self.preview_image_label.config(image="", text="")
         self._preview_photo = None
 
         info = self._theme_info(theme)
         n = info.doc_count if info else len([r for r in self.state.results if r.primary_topic == theme])
-        cands = ", ".join(f"{c} ({df}/{n})" for c, df in (info.candidates[:8] if info else []))
-        self.preview_group_var.set(
-            f"Il nome della cartella vale per tutte le {n} immagini del gruppo.\n"
-            f"Termini candidati: {cands or 'n/d'}"
+        cands = ", ".join(f"{c} ({df}/{n})" for c, df in (info.candidates[:5] if info else []))
+        self._set_status(
+            f"GRUPPO: 📁 {theme} ({n} immagini)   ·   candidati: {cands or 'n/d'}"
         )
 
         self.preview_text.config(state="normal")
@@ -2970,27 +3618,18 @@ class ClassifierApp:
 
     def _show_preview_panel(self, doc: Doc, theme: str) -> None:
         """Miniatura grande + termine scelto + testo OCR con il termine evidenziato."""
-        self.preview_group_var.set("")  # info di gruppo solo sulla riga di gruppo
+        # UI v5 (richiesta utente): alla selezione il testo parte NASCOSTO —
+        # l'immagine prende tutta l'altezza e si apre col pulsante «Testo
+        # OCR» (a quel punto l'immagine si ridimensiona allo spazio residuo).
         self._current_preview_doc = doc
-        try:
-            from PIL import Image, ImageTk
+        self.preview_group_var.set("")  # info di gruppo solo sulla riga di gruppo
+        self._set_ocr_text_visible(False)
 
-            with Image.open(doc.path) as img:
-                img = img.convert("RGB")
-                img.thumbnail((280, 280), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-            self.preview_image_label.config(image=photo, text="")
-            self._preview_photo = photo  # evita il garbage collection
-        except Exception as exc:  # noqa: BLE001
-            self.preview_image_label.config(image="", text=f"Immagine non leggibile:\n{exc}")
-
-        # BADGE SU RIGA SEPARATA (richiesta utente): su una riga sola si
-        # confondeva con il nome del file a seconda della lunghezza.
+        # UI v4: badge e contesto nel DISPLAY di stato (niente etichette
+        # sopra l'immagine).
         saved = doc.path.name in self._saved_ocr_names()
-        badge = "💾 già salvato in ocr_testi.txt" if saved else "⬜ non ancora salvato"
-        self.preview_header_var.set(
-            f"{doc.path.name}    →    📁 {theme}\n{badge}"
-        )
+        badge = "💾 già salvato" if saved else "☐ non salvato"
+        self._set_status(f"{doc.path.name}  →  📁 {theme}   ·   {badge}")
 
         self.preview_text.config(state="normal")
         self.preview_text.delete("1.0", "end")
@@ -3056,27 +3695,13 @@ class ClassifierApp:
         return theme.replace("_", " ")
 
     def _open_full_preview(self, event: Any = None) -> None:  # noqa: ANN401
-        """Doppio click: anteprima grande in una finestra separata."""
-        doc, theme = self._selected_doc_and_theme()
-        if not doc or not doc.path.exists():
+        """Doppio click: niente più finestra separata (piano UI v3): l'immagine
+        è già nell'anteprima prevalente; qui si mostra anche il testo OCR."""
+        doc, _theme = self._selected_doc_and_theme()
+        if doc is None:
             return
-        win = tk.Toplevel(self.root)
-        win.title(f"{doc.path.name} — {theme}")
-        try:
-            from PIL import Image, ImageTk
-
-            with Image.open(doc.path) as img:
-                img = img.convert("RGB")
-                img.thumbnail((520, 520), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-            ttk.Label(win, image=photo).pack(padx=10, pady=10)
-            win._photo_ref = photo  # evita il garbage collection
-        except Exception as exc:  # noqa: BLE001
-            ttk.Label(win, text=f"Anteprima non disponibile: {exc}").pack(padx=10, pady=10)
-        txt = tk.Text(win, width=80, height=14, wrap="word")
-        txt.insert("1.0", doc.text or f"(nessun testo — {doc.error})")
-        txt.config(state="disabled")
-        txt.pack(padx=10, pady=(0, 10), fill="both", expand=True)
+        self._set_ocr_text_visible(True)
+        self._log(f"📄 {doc.path.name}: immagine in anteprima + testo nella zona sotto.")
 
     # -- Cambio del termine prevalente di un GRUPPO ------------------------------
 
@@ -3208,10 +3833,42 @@ class ClassifierApp:
         else:
             ttk.Label(
                 self.rename_cands_frame,
-                text="Nessun candidato: scrivi un termine nuovo.",
+                text="Nessun candidato: scrivi un termine nuovo o scegli tra i temi base.",
             ).pack(anchor="w")
+        # TEMI BASE (piano UI v3, richiesta utente): TUTTI i temi del
+        # dizionario temi.txt come candidati aggiuntivi, anche se NON
+        # compaiono nei testi di questo gruppo — così un nome già
+        # confermato in altre cartelle può essere imposto qui.
+        known_all = [t for t in load_known_themes() if t not in EXCLUDED_TERMS]
+        known_extra = sorted(
+            t for t in known_all if all(t != c for c, _df in candidates)
+        )
+        if known_extra:
+            ttk.Label(
+                self.rename_cands_frame,
+                text="Temi base (dizionario temi.txt):",
+                font=("TkDefaultFont", 9, "bold"),
+            ).pack(anchor="w", pady=(6, 0))
+            # Sottframe dedicato: dentro si usa grid (pack e grid NON possono
+            # coesistere nello stesso frame — i candidati sopra usano pack).
+            base_grid = ttk.Frame(self.rename_cands_frame)
+            base_grid.pack(anchor="w", padx=(20, 0), fill="x")
+            # v6.5 (richiesta utente): griglia a 4 colonne riempita PER
+            # COLONNA (scende e fluisce a destra), come la checklist di
+            # «Sposta nel gruppo» — lettura naturale in ordine alfabetico.
+            rows = (len(known_extra) + 3) // 4 or 1
+            for idx, kw in enumerate(known_extra):
+                # v6.2 (richiesta utente): griglia a 4 colonne come la
+                # checklist di «Sposta nel gruppo» — con molti temi base
+                # l'elenco resta compatto e scorre tutto nella stessa zona.
+                ttk.Radiobutton(
+                    base_grid,
+                    text=kw,
+                    value=kw,
+                    variable=self._rename_radio_var,
+                ).grid(row=idx % rows, column=idx // rows, sticky="w", padx=(0, 10), pady=1)
         self.rename_custom_var.set("")
-        self.rename_panel.pack(fill="x", before=self._work_frame, pady=(0, 8))
+        self._show_zone_d(self.rename_panel)
 
     def _hide_rename_panel(self) -> None:
         self.rename_panel.pack_forget()
@@ -3263,6 +3920,10 @@ class ClassifierApp:
         # Il file temi.txt segue la rinomina: il termine confermato sostituisce
         # il vecchio, così il dizionario dei temi riflette sempre la realtà.
         update_known_theme(old_name, new_name)
+        # v6.9: la rinomina è una scelta A MANO — il nuovo termine entra nel
+        # set dei termini «legittimi» per la cancellazione.
+        self._handmade_themes.add(new_name)
+        self._handmade_themes.discard(old_name)
         self._fill_results_tree(select_theme=new_name)
         # Se la selezione era nel gruppo rinominato, riaggiorno l'anteprima
         theme = self._selected_theme()
@@ -3277,24 +3938,64 @@ class ClassifierApp:
 
     # -- Assegnazione manuale a un gruppo -------------------------------------
 
+    def _selected_docs_and_themes(self) -> list[tuple["Doc", str]]:
+        """TUTTE le immagini selezionate in tabella (Ctrl+click): v6.3 —
+        «Sposta nel gruppo» agisce su più immagini contemporaneamente.
+        Le righe di gruppo vengono ignorate."""
+        out: list[tuple["Doc", str]] = []
+        seen: set[str] = set()
+        for item in self.results_tree.selection():
+            try:
+                values = self.results_tree.item(item, "values")
+            except tk.TclError:
+                continue
+            if not values or len(values) < 3:
+                continue
+            filename, theme = str(values[1]), str(values[2])
+            if not filename or not theme or filename in seen:
+                continue
+            doc = next(
+                (r.doc for r in self.state.results if r.doc.path.name == filename), None
+            )
+            if doc is None and theme == "senza testo":
+                doc = next((d for d in self.state.docs if d.path.name == filename), None)
+            if doc is not None:
+                seen.add(filename)
+                out.append((doc, theme))
+        return out
+
     def _open_assign_panel(self) -> None:
-        doc, theme = self._selected_doc_and_theme()
-        if doc is None:
-            messagebox.showinfo("Sposta nel gruppo", "Seleziona prima un'immagine nella tabella.")
+        docs = self._selected_docs_and_themes()
+        if not docs:
+            messagebox.showinfo(
+                "Sposta nel gruppo",
+                "Seleziona prima un'immagine nella tabella. (Ctrl+click o Maiusc+click per selezionarne piu di una.)",
+                "(La selezione multipla funziona pure con Maiusc+click.)",
+                "(Ctrl+click o Maiusc+click per selezionarne PIÙ di una.)",
+            )
             return
+        # v6.3: MULTI-SELEZIONE — _assign_docs è la lista completa;
+        # _assign_doc/_assign_from_theme restano per retrocompatibilità.
+        self._assign_docs = [d for d, _t in docs]
+        doc, theme = docs[0]
         self._assign_doc = doc
         self._assign_from_theme = theme
-        self.assign_info_var.set(
-            f"Immagine: {doc.path.name}   —   gruppo attuale: «{theme}»"
-        )
+        if len(docs) == 1:
+            self.assign_info_var.set(
+                f"Immagine: {doc.path.name}   —   gruppo attuale: «{theme}»"
+            )
+        else:
+            self.assign_info_var.set(
+                f"IMMAGINI SELEZIONATE: {len(docs)}   —   Ctrl+click per aggiungerne/toglierne. "
+                "«Assegna» sposta TUTTE nel gruppo spuntato."
+            )
         # Radio dei gruppi esistenti (analisi corrente), il gruppo attuale
         # pre-selezionato; «senza testo» incluso per farne uscire le immagini.
         # DIZIONARIO GLOBALE DEI TEMI (richiesta utente: i temi di questo
         # gruppo esempio ci saranno anche nelle prossime cartelle): le voci
         # di D:\dizionari\temi.txt sono disponibili come destinazione anche
         # se non compaiono in questa analisi.
-        # CHECKLIST dei gruppi (analisi corrente + temi noti):
-        # spunta 1 per assegnare, N per cancellare gruppi.
+        # RADIO dei gruppi (analisi corrente + temi noti): selezione UNICA.
         groups = sorted({r.primary_topic for r in self.state.results})
         for d in self.state.docs:
             if not d.text.strip() and d.path.name not in {
@@ -3305,25 +4006,27 @@ class ClassifierApp:
         groups = sorted(set(groups) | set(known))
         for w in self.assign_radios_frame.winfo_children():
             w.destroy()
-        # Variabili di spunta: LISTA PULITA a ogni apertura (richiesta
-        # utente: nessuna spunta pre-impostata, si spunta solo quello
-        # che serve — evita il conflitto "puoi assegnare un solo gruppo").
-        self._assign_checks = {}
-        col = 0
-        for g in groups:
-            var = tk.BooleanVar(value=False)
-            self._assign_checks[g] = var
-            ttk.Checkbutton(
+        # v6.9: RADIO BUTTON — niente spunte multiple: selezioni la
+        # destinazione e «Assegna» muove tutte le immagini selezionate lì.
+        self._assign_dest_var.set("")
+        # v6.5+6.9: riempimento PER COLONNA, con numero di colonne calcolato
+        # sullo spazio REALE del pannello (il filetto della sezione arriva
+        # quasi a metà finestra: col font misurato ci stanno 6 colonne,
+        # mai meno di 4 — niente più colonne d'aria).
+        labels = ["📁 senza testo" if g == "senza testo" else f"📁 {g}" for g in groups]
+        cols = self._fit_columns(labels, self.assign_panel.winfo_width())
+        rows = (len(groups) + cols - 1) // cols or 1
+        for idx, (g, lab) in enumerate(zip(groups, labels)):
+            ttk.Radiobutton(
                 self.assign_radios_frame,
-                text=("📁 senza testo" if g == "senza testo" else f"📁 {g}"),
-                variable=var,
-            ).grid(row=col // 4, column=col % 4, sticky="w", padx=(0, 10), pady=1)
-            col += 1
+                text=lab,
+                value=g,
+                variable=self._assign_dest_var,
+            ).grid(row=idx % rows, column=idx // rows, sticky="w", padx=(0, 10), pady=1)
         self._assign_new_var.set(False)
         self.assign_new_name_var.set("")
         self.assign_new_entry.config(state="disabled")
-        self.assign_panel.pack(fill="x", before=self.preview_image_label)
-        self._scroll_to(self.assign_panel)
+        self._show_zone_d(self.assign_panel)
 
     def _assign_toggle_new(self) -> None:
         self.assign_new_entry.config(
@@ -3334,58 +4037,11 @@ class ClassifierApp:
         self.assign_panel.pack_forget()
         self._assign_doc = None
 
-    def _delete_checked_groups(self) -> None:
-        r"""Cancella i gruppi SPUNTATI (N spunte): le loro immagini tornano nel
-        gruppo «senza testo» (restano in tabella, nulla si perde). I temi
-        cancellati vengono tolti anche da D:\dizionari\temi.txt. Il gruppo
-        dell'immagine selezionata non è cancellabile (è il gruppo corrente)."""
-        checked = [g for g, v in self._assign_checks.items() if v.get()]
-        if not checked:
-            messagebox.showinfo("Cancella gruppi", "Spunta prima i gruppi da cancellare.")
-            return
-        doc, cur_theme = self._selected_doc_and_theme()
-        # Le immagini dei gruppi cancellati tornano «senza testo».
-        freed = 0
-        for g in checked:
-            if g == "senza testo":
-                messagebox.showinfo("Cancella gruppi", "«senza testo» non è cancellabile.")
-                continue
-            if g == cur_theme:
-                messagebox.showinfo(
-                    "Cancella gruppi",
-                    f"Il gruppo «{g}» contiene l'immagine selezionata:\n"
-                    "spostala prima in un altro gruppo, poi cancellalo.",
-                )
-                continue
-            n = sum(1 for r in self.state.results if r.primary_topic == g)
-            self.state.results = [
-                r for r in self.state.results if r.primary_topic != g
-            ]
-            self.state.themes = [t for t in self.state.themes if t.name != g]
-            freed += n
-            self._log(f"🗑 Gruppo «{g}» cancellato ({n} immagini → senza testo).")
-        # Rimuove i temi cancellati anche dal dizionario globale temi.txt
-        known = load_known_themes()
-        kept = [t for t in known if t not in checked]
-        if kept != known:
-            save_known_themes(kept)
-            self._log(f"📖 Temi rimossi da {TEMI_FILE.name}: {', '.join(set(known) - set(kept))}")
-        if not freed and kept == known:
-            return
-        # doc_count aggiornati, tabella ricaricata (selezione mantenuta);
-        # checklist ripulita.
-        for v in self._assign_checks.values():
-            v.set(False)
-        for t in self.state.themes:
-            t.doc_count = sum(1 for r in self.state.results if r.primary_topic == t.name)
-        self._fill_results_tree(select_theme=cur_theme)
-        if doc is not None:
-            self._show_preview_panel(doc, cur_theme)
-        self._log(f"✅ Gruppi cancellati. {freed} immagini tornano nel gruppo «senza testo».")
-
     def _apply_assign(self) -> None:
-        doc = self._assign_doc
-        if doc is None:
+        docs: list[Doc] = getattr(self, "_assign_docs", None) or (
+            [self._assign_doc] if self._assign_doc is not None else []
+        )
+        if not docs:
             return
         from_theme = getattr(self, "_assign_from_theme", "")
         if self._assign_new_var.get():
@@ -3401,29 +4057,22 @@ class ClassifierApp:
                 messagebox.showwarning("Termine già usato", f"Esiste già un gruppo «{new_group}».")
                 return
         else:
-            # CHECKLIST: esattamente UNA spunta seleziona la destinazione.
-            checked = [g for g, v in self._assign_checks.items() if v.get()]
-            if len(checked) == 0:
-                messagebox.showinfo("Sposta nel gruppo", "Spunta UN gruppo di destinazione.")
+            # v6.9: RADIO — la destinazione è il gruppo selezionato (uno solo).
+            new_group = self._assign_dest_var.get()
+            if not new_group:
+                messagebox.showinfo("Sposta nel gruppo", "Seleziona il gruppo di destinazione.")
                 return
-            if len(checked) > 1:
-                messagebox.showinfo(
-                    "Sposta nel gruppo",
-                    "Hai spuntato " + str(len(checked)) + " gruppi.\n"
-                    "Per ASSEGNARE spunta UN solo gruppo\n"
-                    "(più spunte servono per CANCELLARE gruppi).",
-                )
-                return
-            new_group = checked[0]
-            if new_group == from_theme:
-                self._hide_assign_panel()
-                return
+            # v6.3: new_group == from_theme NON chiude più in blocco —
+            # il ciclo sotto sposta solo le immagini di ALTRI gruppi
+            # (multi-selezione da più gruppi verso una destinazione).
         # Il gruppo «senza testo» non è in self.state.themes: crearlo se serve.
         if new_group != "senza testo" and not any(t.name == new_group for t in self.state.themes):
             self.state.themes.append(
                 ThemeInfo(name=new_group, candidates=[], doc_count=0, doc_frequency=0, raw_term=new_group)
             )
             self._log(f"➕ Nuovo gruppo creato: «{new_group}»")
+            # v6.9: gruppo creato a mano = cancellabile dalla card dedicata.
+            self._handmade_themes.add(new_group)
             # Il tema nuovo entra SUBITO nel dizionario globale dei temi:
             # così si mantiene anche se l'utente chiude l'app senza rilanciare
             # la FASE 2 (richiesta utente: "si mantengono se chiudo l'app?").
@@ -3431,33 +4080,51 @@ class ClassifierApp:
             if new_group not in known_now:
                 if save_known_themes(known_now + [new_group]):
                     self._log(f"📖 Tema «{new_group}» salvato in {TEMI_FILE}.")
-        if new_group == "senza testo":
-            # Rimuovi dai risultati: torna nel gruppo «senza testo» della tabella.
-            self.state.results = [
-                r for r in self.state.results if r.doc.path.name != doc.path.name
-            ]
-        else:
-            for r in self.state.results:
-                if r.doc.path.name == doc.path.name:
-                    r.primary_topic = new_group
-                    break
+        # v6.3: sposta TUTTE le immagini selezionate (salta quelle già
+        # nel gruppo di destinazione).
+        moved = 0
+        for d in docs:
+            if new_group != "senza testo" and any(
+                r.primary_topic == new_group and r.doc.path.name == d.path.name
+                for r in self.state.results
+            ):
+                continue  # già lì
+            if new_group == "senza testo":
+                # Rimuovi dai risultati: torna nel gruppo «senza testo».
+                self.state.results = [
+                    r for r in self.state.results if r.doc.path.name != d.path.name
+                ]
             else:
-                # Immagine che era «senza testo»: entra nei risultati.
-                self.state.results.append(
-                    DocResult(doc=doc, primary_topic=new_group, score=0.0)
-                )
+                for r in self.state.results:
+                    if r.doc.path.name == d.path.name:
+                        r.primary_topic = new_group
+                        break
+                else:
+                    # Immagine che era «senza testo»: entra nei risultati.
+                    self.state.results.append(
+                        DocResult(doc=d, primary_topic=new_group, score=0.0)
+                    )
+            moved += 1
+        if not moved:
+            self._hide_assign_panel()
+            return
         # doc_count dei gruppi coinvolti aggiornato.
         for t in self.state.themes:
             t.doc_count = sum(1 for r in self.state.results if r.primary_topic == t.name)
-        self._log(
-            f"➡️  {doc.path.name} spostata dal gruppo «{from_theme}» al gruppo «{new_group}» (assegnazione manuale)."
-        )
+        if moved == 1:
+            self._log(
+                f"➡️  {docs[0].path.name} spostata nel gruppo «{new_group}» (assegnazione manuale)."
+            )
+        else:
+            self._log(
+                f"➡️  {moved} immagini spostate nel gruppo «{new_group}» (assegnazione manuale multipla)."
+            )
+        doc = docs[0]
         # Checklist RIPULITA dopo l'assegnazione (richiesta utente: nessuna
         # spunta residua che blocchi l'assegnazione successiva).
-        for v in self._assign_checks.values():
-            v.set(False)
+        self._assign_dest_var.set("")
         self._fill_results_tree(select_theme=new_group)
-        # Riapri l'anteprima sull'immagine spostata (nel suo nuovo gruppo).
+        # Riapri l'anteprima sulla prima immagine spostata (nel suo nuovo gruppo).
         self._show_preview_panel(doc, new_group if new_group != "senza testo" else "senza testo")
         self._hide_assign_panel()
 
@@ -3474,19 +4141,62 @@ class ClassifierApp:
                 return
         self.state.output_dir = output_dir
 
-        if not messagebox.askyesno(
-            "Conferma",
-            f"Spostare {len([r for r in self.state.results if not r.doc.error])} immagini "
-            f"in sottocartelle per tema dentro:\n{output_dir}?",
-        ):
-            return
-
+        ok_results = [r for r in self.state.results if not r.doc.error]
+        # GRUPPI SISTEMATI (richiesta utente v5): la spunta ✔ significa
+        # «questo gruppo è pronto» → la FASE 3 sposta SOLO i gruppi spuntati,
+        # un po' alla volta (200/400 immagini sono troppo per un colpo solo).
+        themes_present = {r.primary_topic for r in ok_results}
+        checked = sorted(self._saved_groups & themes_present)
+        if checked:
+            todo = [r for r in ok_results if r.primary_topic in self._saved_groups]
+            if not messagebox.askyesno(
+                "Conferma",
+                f"Spostare SOLO i gruppi ✔ sistemati ({len(checked)}: "
+                f"{', '.join(checked)}) = {len(todo)} immagini dentro:\n{output_dir}?",
+            ):
+                return
+        elif ok_results:
+            if not messagebox.askyesno(
+                "Nessun gruppo spuntato",
+                "Nessun gruppo ha la spunta ✔ «da spostare».\n"
+                "Spostare TUTTI i gruppi? (Annulla se prima vuoi spuntarne qualcuno.)",
+            ):
+                return
+            todo = ok_results
+        else:
+            todo = []
+        # v6.3 (richiesta utente): SALVATAGGIO AUTOMATICO DEI TESTI alla
+        # pressione del tasto 3 — per OGNI immagine che sta per essere
+        # spostata, il testo di FASE 1 (incluso il testo corretto con
+        # Aggiungi testo / Scansione avanzata) viene accodato a
+        # ocr_testi.txt con l'header «===== nomefile =====». Quelle già
+        # salvate sono saltate (nessun duplicato). Così, anche dopo lo
+        # spostamento in output, i testi restano disponibili per le
+        # revisioni, una scansione avanzata successiva e il dizionario.
+        _target = (self.state.input_dir or Path.cwd()) / "ocr_testi.txt"
+        _already = set(saved_ocr_texts(self.state.input_dir).keys())
+        _appended = 0
+        try:
+            with _target.open("a", encoding="utf-8") as _fh:
+                for _r in todo:
+                    if _r.doc.path.name in _already or not _r.doc.text.strip():
+                        continue
+                    _fh.write(f"===== {_r.doc.path.name} =====\n")
+                    _fh.write(_r.doc.text.strip() + "\n\n")
+                    _appended += 1
+            if _appended:
+                self._log(
+                    f"💾 Salvati automaticamente {_appended} testi in {_target.name} "
+                    "(quelle già salvate sono saltate)."
+                )
+        except Exception as _exc:  # noqa: BLE001
+            self._log(f"⚠️  Salvataggio automatico dei testi non riuscito: {_exc}")
         self._set_busy(True)
         self._log("\n📦 FASE 3 - Spostamento delle immagini nelle cartelle per tema…")
 
         def worker() -> None:
             try:
-                moved = move_files_to_folders(self.state.results, output_dir)
+                moved = move_files_to_folders(todo, output_dir)
                 report = write_report(self.state.results, output_dir)
                 self.root.after(0, lambda: self._after_move(moved, report))
             except Exception as exc:  # noqa: BLE001
@@ -3508,6 +4218,27 @@ class ClassifierApp:
         if report:
             self._log(f"📝 Report salvato: {report}")
         self._log("\n🎉 Fatto! Le immagini sono state organizzate per concetto.")
+        # v6.4 (richiesta utente): le immagini spostate escono dalla tabella.
+        # I risultati (e i doc) dei file non piu' presenti nella cartella
+        # input vengono rimossi, poi la tabella viene ricaricata: restano
+        # solo le immagini ancora da sistemare.
+        moved_names = {name for name, _dest in moved}
+        if moved_names:
+            self.state.results = [
+                r for r in self.state.results if r.doc.path.name not in moved_names
+            ]
+            self.state.docs = [
+                d for d in self.state.docs if d.path.name not in moved_names
+            ]
+            for t in self.state.themes:
+                t.doc_count = sum(
+                    1 for r in self.state.results if r.primary_topic == t.name
+                )
+            self.state.selected = None
+            self._fill_results_tree()
+            self._clear_preview()
+        # v6.7: le cartelle generate aumentano dopo lo spostamento.
+        self._update_progress(3)
         self._refresh_buttons()
         self.btn_move.config(state="disabled")
 
