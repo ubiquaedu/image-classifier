@@ -4,8 +4,12 @@ __pycache__/
 
 # Dati utente accumulati (non codice)
 ocr_testi.txt
+ocr_testi.bak
+ocr_testi_tradotto.txt
 parole_escluse.txt
 immagine_prova_lens.png
+log_app.txt
+gruppi_frequenze.csv
 
 # Copie di backup
 * - Copia*.py
@@ -16,3 +20,4 @@ immagine_prova_lens.png
 # Sistema
 Thumbs.db
 Desktop.ini
+*.bak

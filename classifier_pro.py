@@ -642,38 +642,53 @@ def remove_saved_group(name: str) -> None:
         pass
 
 
-def saved_ocr_texts(input_dir: Path | None) -> dict[str, str]:
+def saved_ocr_texts(input_dir: Path | None, include_groups: bool = False) -> dict[str, str]:
     """Testi già riconosciuti, letti dal file accumulo ocr_testi.txt della
     cartella input: {nomefile: testo}. Serve per NON ri-scansionare con
     Tesseract le immagini già elaborate nelle sessioni precedenti
-    (risparmio di tempo/CPU: si ri-scansionano solo le immagini NUOVE)."""
+    (risparmio di tempo/CPU: si ri-scansionano solo le immagini NUOVE).
+
+    v7.3 (testi distribuiti per gruppo): con include_groups=True legge
+    ANCHE i ocr_testi.txt delle SOTTOCARTELLE della cartella input — i
+    gruppi creati alla FASE 3. In caso di doppia voce (root + gruppo)
+    vince quella DEL GRUPPO, la più specifica.
+    NB: include_groups vale solo quando le immagini cercate stanno nella
+    radice del corpus: le chiamate dell'app passano la cartella input, che
+    per la riverifica È la radice con i gruppi dentro."""
     if input_dir is None:
         return {}
-    f = input_dir / ACCUMULO_FILE
-    if not f.exists():
-        return {}
-    texts: dict[str, str] = {}
-    try:
-        lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Lettura ocr_testi.txt non riuscita: %s", exc)
-        return {}
-    cur: str | None = None
-    buf: list[str] = []
-    for ln in lines:
-        s = ln.strip()
-        if s.startswith("=====") and s.endswith("=====") and len(s) > 10:
-            name = s[5:-5].strip()
-            if cur is not None:
-                texts[cur] = "\n".join(buf).strip()
-            if name and not name.startswith("dizionario"):
-                cur, buf = name, []
-            else:
-                cur, buf = None, []
-        elif cur is not None:
-            buf.append(ln)
-    if cur is not None:
-        texts[cur] = "\n".join(buf).strip()
+
+    def parse_accumulo(f: Path) -> dict[str, str]:
+        texts: dict[str, str] = {}
+        try:
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Lettura %s non riuscita: %s", f.name, exc)
+            return {}
+        cur: str | None = None
+        buf: list[str] = []
+        for ln in lines:
+            s = ln.strip()
+            if s.startswith("=====") and s.endswith("=====") and len(s) > 10:
+                name = s[5:-5].strip()
+                if cur is not None:
+                    texts[cur] = "\n".join(buf).strip()
+                if name and not name.startswith("dizionario"):
+                    cur, buf = name, []
+                else:
+                    cur, buf = None, []
+            elif cur is not None:
+                buf.append(ln)
+        if cur is not None:
+            texts[cur] = "\n".join(buf).strip()
+        return texts
+
+    texts = parse_accumulo(input_dir / ACCUMULO_FILE)
+    if include_groups:
+        for sub in sorted(input_dir.iterdir()):
+            f = sub / ACCUMULO_FILE
+            if sub.is_dir() and f.exists():
+                texts.update(parse_accumulo(f))
     return texts
 
 
@@ -725,6 +740,99 @@ def save_learned_vocabulary(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Dizionario di apprendimento non aggiornato: %s", exc)
 
+
+
+# ---------------------------------------------------------------------------
+# Pulizia dei testi OCR (v7.2, richiesta utente)
+# ---------------------------------------------------------------------------
+# Due problemi da sistemare nel file accumulo ocr_testi.txt:
+# 1. slogan corti: l'immagine genera QUALCHE carattere spurio (font di
+#    simboli, glifi decorativi) intorno al testo vero -> si tolgono subito
+#    al momento della riapertura (riuso) e della traduzione;
+# 2. interi testi che NON sono passati all'OCR: solo simboli e caratteri
+#    strani -> segnalati dopo la scansione, cancellabili con un click
+#    (backup automatico del file prima della riscrittura).
+
+_JUNK_CHARS_RE = re.compile(
+    "["
+    # solo glifi DECORATIVI: niente whitelist che taglierebbe € % °
+    "─-◿"   # box drawing, forme geometriche
+    "☀-➿"   # simboli vari, dingbats
+    "⬀-⯿"   # simboli e frecce
+    "←-⇿"   # frecce
+    "-"   # PRIVATE USE AREA (font di simboli!)
+    "ﬀ-ﭏ"   # legature di presentazione
+    "̀-ͯ"   # accenti combinanti spurii
+    "]"
+)
+# È un carattere «di riempimento» che Tesseract prova su tratti decorativi
+# e font di simboli: appare spesso da solo o ripetuto.
+_FILLER_RE = re.compile(r"(?:^|\s)Ç(?:\s|$)")
+_RATIO_OK = 0.55   # sotto: il testo è quasi tutto spazzatura
+_MIN_CLEAN_LEN = 3
+
+
+def clean_ocr_text(text: str) -> tuple[str, bool]:
+    """Pulisce UN testo OCR: toglie i caratteri spurii dei font di simboli.
+
+    Ritorna (testo_pulito, era_fanco). Il testo resta intatto se la pulizia
+    non trova niente da togliere (nessun danno per i testi buoni).
+    """
+    if not text or not text.strip():
+        return text, False
+    out = text
+    n0 = len(out)
+    # 1) glifo di riempimento isolato o ripetuto (Ç su tratti decorativi)
+    out = _FILLER_RE.sub(" ", out)
+    # 2) caratteri fuori dagli alfabeti noti (simboli decorativi, box-drawing…)
+    out = _JUNK_CHARS_RE.sub("", out)
+    # 3) ripetizioni istantanee: "!!!!" -> "!", "....." -> "."
+    out = re.sub(r"([!?.,;:])\1{2,}", r"\1", out)
+    # 4) spazi multipli e bordi
+    out = re.sub(r"[ 	]{2,}", " ", out)
+    out = re.sub(r" ?\n ?", "\n", out).strip()
+    # 5) righe ridotte a pure spazzatura
+    keep: list[str] = []
+    for ln in out.splitlines():
+        good = len(re.findall(r"[\wà-ÿЀ-ӿ]", ln))
+        if good >= _MIN_CLEAN_LEN or good >= len(ln) * 0.5:
+            keep.append(ln.strip())
+    out = "\n".join(keep).strip()
+    return out, len(out) < max(1, int(n0 * _RATIO_OK))
+
+
+def clean_saved_ocr_texts(
+    input_dir: Path | None, include_groups: bool = False
+) -> tuple[dict[str, str], list[str]]:
+    """Legge ocr_testi.txt applicando clean_ocr_text a ogni testo.
+
+    Ritorna ({nomefile: testo_pulito}, [nomi dei testi CARTACEI, cioè
+    rimasti quasi vuoti dopo la pulizia])."""
+    raw = saved_ocr_texts(input_dir, include_groups=include_groups)
+    clean: dict[str, str] = {}
+    dead: list[str] = []
+    for name, text in raw.items():
+        fixed, fanco = clean_ocr_text(text)
+        if fixed:
+            clean[name] = fixed
+        if fanco or not fixed:
+            dead.append(name)
+    return clean, dead
+
+
+def rewrite_ocr_texts_file(input_dir: Path, texts: dict[str, str]) -> Path:
+    """Riscrive ocr_testi.txt SOLO con i testi puliti (backup automatico:
+    ocr_testi.bak, sovrascritto ad ogni pulizia). Header compatibili con
+    dizionario, riverifica e traduzione."""
+    src = input_dir / ACCUMULO_FILE
+    bak = input_dir / "ocr_testi.bak"
+    if src.exists():
+        bak.write_text(src.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+    with src.open("w", encoding="utf-8") as fh:
+        for name, text in texts.items():
+            fh.write(f"===== {name} =====\n")
+            fh.write(text.strip() + "\n\n")
+    return bak
 
 
 def all_stopwords_list() -> list[str]:
@@ -1322,12 +1430,18 @@ def compute_proposed_names(
     texts: list[str],
     labels: list[int],
     known_themes: list[str] | None = None,
+    docs: list[Doc] | None = None,
 ) -> list[ThemeInfo]:
     """Per ogni cluster propone un singolo termine come nome cartella.
 
     I candidati sono le PAROLE PIÙ FREQUENTI dei testi del gruppo (frequenza
     totale di occorrenze); il termine scelto è quello presente nel numero
     maggiore di immagini del gruppo, a parità vince la frequenza totale.
+
+    v7.1 (richiesta utente): se arrivano anche i documenti, un termine
+    presente nei NOMI FILE delle immagini del gruppo ha priorità — il
+    titolo esplicativo che si ripete batte la parola spuria ripetuta
+    nei soli testi (es. 9/9 titoli con «sunset» vs «what» x5 per testo).
     """
     themes: list[ThemeInfo] = []
     used: set[str] = set()
@@ -1341,6 +1455,22 @@ def compute_proposed_names(
     for lab in unique_labels:
         member_texts = [t for t, l in zip(texts, labels) if l == lab]
         combined = "\n".join(member_texts)
+        # v7.1: token dei nomi file dei membri del gruppo — serve per la
+        # priorità ai termini comuni ai titoli (docs=None: niente nomi).
+        if docs is not None:
+            member_docs = [d for d, l in zip(docs, labels) if l == lab]
+            fn_tokens = [set(_filename_tokens(d.path.name)) for d in member_docs]
+        else:
+            member_docs = []
+            fn_tokens = []
+
+        def _fn_cov(term: str) -> int:
+            """In quanti nomi file del gruppo compaiono TUTTI i token del termine."""
+            if not fn_tokens:
+                return 0
+            toks = set(re.findall(r"[a-zà-ÿ]{3,}", term.lower())) or {term.lower()}
+            return sum(1 for ft in fn_tokens if toks and toks.issubset(ft))
+
         # primi candidati per frequenza totale nel gruppo; se il gruppo non
         # ha NESSUN candidato valido (tutte parole escluse/stopword) il gruppo
         # mantiene il contatore doc_count così le immagini restano visibili.
@@ -1359,6 +1489,23 @@ def compute_proposed_names(
             )
             if df > 0 and kw not in [c[0] for c in candidates]:
                 candidates.append((kw, df))
+        # v7.1 (richiesta utente): i termini comuni ai NOMI FILE del gruppo
+        # entrano tra i candidati anche se NON compaiono nei testi OCR —
+        # il titolo esplicativo è a tutti gli effetti un testo del gruppo.
+        # Solo token in almeno metà dei titoli (stopword escluse); la loro
+        # copertura nomi file li fa salire in cima al momento dell'ordine.
+        if docs is not None and fn_tokens:
+            tok_counter: dict[str, int] = {}
+            for ft in fn_tokens:
+                for tok in ft:
+                    tok_counter[tok] = tok_counter.get(tok, 0) + 1
+            n_fn = len(fn_tokens)
+            _stop = set(all_stopwords_list())
+            for tok, cnt in sorted(tok_counter.items(), key=lambda kv: -kv[1]):
+                if cnt * 2 >= n_fn and tok not in _stop and tok not in [
+                    c[0] for c in candidates
+                ]:
+                    candidates.append((tok, 0))
         # ordina per frequenza documentale, a parità per frequenza totale;
         # i temi confermati dall'utente hanno PRIORITÀ a paritÀ:
         # sono i nomi giusti confermati nei set precedenti.
@@ -1366,14 +1513,16 @@ def compute_proposed_names(
         n_imgs = max(1, len(member_texts))
         known_set = set(known)
         # PUNTEGGIO (richiesta utente: «voglio il termine comune al gruppo»):
-        # la copertura (in quante immagini compare) conta DOPPIO rispetto
-        # alla frequenza totale. Un termine presente in 9/9 immagini batte
-        # uno spurio (what, which…) presente in più copie ma in meno
-        # immagini; i temi confermati hanno priorità SOLO con copertura
-        # magggiore o uguale a metà del gruppo (prima bastava 1 immagine).
+        # 1) i temi confermati dall'utente con copertura >= metà gruppo;
+        # 2) v7.1: la copertura nei NOMI FILE (termine comune ai titoli);
+        # 3) la copertura nei testi (in quante immagini compare) contata
+        #    DOPPIO rispetto alla frequenza totale. Un termine presente in
+        #    9/9 immagini batte uno spurio presente in più copie ma in meno
+        #    immagini; un termine presente in 9/9 TITOLI batte tutti.
         candidates.sort(
             key=lambda c: (
                 0 if (c[0] in known_set and c[1] * 2 >= n_imgs) else 1,
+                -_fn_cov(c[0]),
                 -(2 * c[1] + total_of.get(c[0], 0)),
             )
         )
@@ -1428,7 +1577,11 @@ def classify_documents(
 ) -> tuple[list[DocResult], list[ThemeInfo]]:
     """Assegna ogni documento al suo tema e calcola i punteggi TF-IDF."""
     texts = [d.text for d in docs]
-    themes = compute_proposed_names(texts, labels, known_themes=known_themes)
+    # v7.1: i documenti passano anche alla scelta dei nomi per la priorità
+    # ai termini comuni ai nomi file.
+    themes = compute_proposed_names(
+        texts, labels, known_themes=known_themes, docs=docs
+    )
 
     # mappa (cluster_index -> position in themes list)
     label_to_pos = {lab: pos for pos, lab in enumerate(sorted(set(labels)))}
@@ -1558,7 +1711,21 @@ def move_files_to_folders(results: list[DocResult], output_dir: Path) -> list[tu
     return moved
 
 
-def write_report(results: list[DocResult], output_dir: Path) -> Path | None:
+def append_ocr_section(target: Path, name: str, text: str, ending: str | None = None) -> bool:
+    """v7.3: accoda una sezione «===== nome =====» al file accumulo indicato
+    (di solito ocr_testi.txt della cartella-gruppo). False se il nome è
+    già presente nel file (nessun duplicato). ending=None = rileva quello
+    del file esistente (CRLF su Windows)."""
+    ending = ending or ("\r\n" if target.exists() and "\r\n" in target.read_text(encoding="utf-8", errors="replace")[:8192] else "\n")
+    if target.exists() and name.casefold() in {
+        h[5:-5].strip().casefold() for h in target.read_text(encoding="utf-8", errors="replace").splitlines() if h.strip().startswith("=====") and h.strip().endswith("=====")
+    }:
+        return False
+    with target.open("a", encoding="utf-8", newline="") as fh:
+        fh.write(f"===== {name} =====" + ending)
+        fh.write(text.strip() + ending)
+        fh.write(ending)
+    return True
     """Scrive un report CSV della classificazione."""
     try:
         report_path = output_dir / "report.csv"
@@ -2635,10 +2802,41 @@ class ClassifierApp:
         if not input_dir:
             messagebox.showinfo("Traduzione", "Seleziona prima una cartella input.")
             return
-        src = input_dir / "ocr_testi.txt"
-        if not src.exists():
-            messagebox.showinfo("Traduzione", f"{src.name} non esiste ancora: salva prima dei testi.")
+        # v7.3: scelta del GRUPPO — si traduce il ocr_testi.txt della
+        # cartella-gruppo scelta; «tutti» unisce root+gruppi al volo.
+        groups = sorted(
+            d.name
+            for d in input_dir.iterdir()
+            if d.is_dir() and (d / "ocr_testi.txt").exists()
+        )
+        if not groups:
+            messagebox.showinfo(
+                "Traduzione",
+                "Nessun gruppo con ocr_testi.txt nelle sottocartelle.\n"
+                "Sposta prima le immagini (FASE 3): i testi finiscono nei gruppi.",
+            )
             return
+        all_src = input_dir / "ocr_testi.txt"
+        if all_src.exists():
+            groups = ["tutti"] + groups
+        choice = (simpledialog.askstring(
+            "Traduzione",
+            "Gruppo da tradurre (uno dei seguenti):\n\n"
+            + "\n".join(groups)
+            + "\n\nScrivi il nome (o «tutti»):",
+            initialvalue=groups[0],
+        ) or "").strip()
+        if not choice:
+            return
+        use_all = choice.casefold() in ("tutti", "tutte")
+        match = next(
+            (g for g in groups[1:] if g.casefold() == choice.casefold()), None
+        )
+        if not use_all and match is None:
+            messagebox.showinfo("Traduzione", f"Gruppo non trovato: {choice}")
+            return
+        src = all_src if use_all else input_dir / match / "ocr_testi.txt"
+        out_dir = input_dir if use_all else input_dir / match
         try:
             import argostranslate  # noqa: F401, PLC0415
         except Exception:
@@ -2648,7 +2846,12 @@ class ClassifierApp:
                 "poi scarica i pacchetti lingua con scarica_pacchetti_traduzione.py",
             )
             return
-        pairs = saved_ocr_texts(input_dir)  # nome file → testo
+        # v7.2: i testi da tradurre arrivano puliti (spurii tolti subito).
+        # v7.3: «tutti» = unione root+gruppi; un gruppo = solo il suo file.
+        if use_all:
+            pairs, _dead_t = clean_saved_ocr_texts(input_dir, include_groups=True)
+        else:
+            pairs, _dead_t = clean_saved_ocr_texts(input_dir / match)
         if not pairs:
             messagebox.showinfo("Traduzione", "ocr_testi.txt è vuoto.")
             return
@@ -2658,7 +2861,7 @@ class ClassifierApp:
         def worker() -> None:
             try:
                 from argostranslate import translate as _tr  # noqa: PLC0415
-                out_path = input_dir / "ocr_testi_tradotto.txt"
+                out_path = out_dir / "ocr_testi_tradotto.txt"
                 done = 0
                 with out_path.open("w", encoding="utf-8") as fh:
                     for name, text in pairs.items():
@@ -2974,7 +3177,12 @@ class ClassifierApp:
                 # OTTIMIZZAZIONE CPU (richiesta utente): le immagini il cui
                 # testo è già in ocr_testi.txt NON vengono ri-scansionate —
                 # si riusa il testo salvato. Solo le NUOVE vanno a Tesseract.
-                already = saved_ocr_texts(input_dir)
+                # v7.2: i testi riusati da ocr_testi.txt arrivano PULITI
+                # (spurii dei font di simboli tolti subito; i testi fanco
+                # vengono segnalati a fine scansione).
+                already, _scan_dead = clean_saved_ocr_texts(
+                    input_dir, include_groups=self.include_output_var.get()
+                )
                 to_scan = [f for f in files if f.name not in already]
                 reused = 0
                 # v7: i file nelle SOTTOCARTELLE di output hanno già un gruppo
@@ -3086,6 +3294,31 @@ class ClassifierApp:
             self._log("   File con errori:")
             for d in failed[:10]:
                 self._log(f"   • {d.path.name}: {d.error}")
+        # v7.2 (richiesta utente): segnalazione dei testi OCR «fanco»
+        # (solo simboli/caratteri di font decorativi) presenti in
+        # ocr_testi.txt, con proposta di pulizia immediata (backup
+        # automatico ocr_testi.bak prima della riscrittura).
+        _id = self.state.input_dir
+        if _id is not None:
+            try:
+                _, _dead = clean_saved_ocr_texts(_id)
+            except Exception:
+                _dead = []
+            if _dead:
+                self._log(f"\n[!] {len(_dead)} testi in ocr_testi.txt sembrano SOLO simboli/caratteri strani:")
+                for _nm in _dead[:10]:
+                    self._log(f"   • {_nm}")
+                if len(_dead) > 10:
+                    self._log(f"   ... e altri {len(_dead) - 10}")
+                if messagebox.askyesno(
+                    "Pulizia testi OCR",
+                    f"{len(_dead)} testi in ocr_testi.txt sembrano fatti solo di\n"
+                    "simboli o caratteri di font decorativi (nessuna parola).\n\n"
+                    "Eliminarli ora dal file? (backup automatico: ocr_testi.bak)",
+                ):
+                    _clean, _ = clean_saved_ocr_texts(_id)
+                    _bak = rewrite_ocr_texts_file(_id, _clean)
+                    self._log(f"[pulito] ocr_testi.txt: rimossi {len(_dead)} testi fanco (backup: {_bak.name}).")
         self._refresh_buttons()
         # v6.7: indicatori di progressione aggiornati a fine FASE 1.
         self._update_progress(1)
@@ -3327,8 +3560,13 @@ class ClassifierApp:
         selected = self.results_tree.selection()
         if not selected:
             return None, ""
+        # v6.10 (richiesta utente): con la selezione multipla (Ctrl+click)
+        # selection()[0] resta sulla PRIMA riga scelta e l'anteprima non
+        # seguiva l'ultima immagine cliccata: si usa focus(), che punta
+        # sempre all'ultima riga su cui si è cliccato.
+        item = self.results_tree.focus() or selected[0]
         try:
-            values = self.results_tree.item(selected[0], "values")
+            values = self.results_tree.item(item, "values")
         except tk.TclError:
             return None, ""  # selezione obsoleta (riga ricreata)
         if not values or len(values) < 2:
@@ -3351,7 +3589,8 @@ class ClassifierApp:
         if not selected:
             return None
         try:
-            values = self.results_tree.item(selected[0], "values")
+            item = self.results_tree.focus() or selected[0]
+            values = self.results_tree.item(item, "values")
         except tk.TclError:
             return None  # selezione obsoleta (riga ricreata)
         if values and len(values) >= 2:
@@ -4432,9 +4671,8 @@ class ClassifierApp:
         if not docs:
             messagebox.showinfo(
                 "Sposta nel gruppo",
-                "Seleziona prima un'immagine nella tabella. (Ctrl+click o Maiusc+click per selezionarne piu di una.)",
-                "(La selezione multipla funziona pure con Maiusc+click.)",
-                "(Ctrl+click o Maiusc+click per selezionarne PIÙ di una.)",
+                "Seleziona prima un'immagine nella tabella "
+                "(Ctrl+click o Maiusc+click per selezionarne più di una).",
             )
             return
         # v6.3: MULTI-SELEZIONE — _assign_docs è la lista completa;
@@ -4628,38 +4866,63 @@ class ClassifierApp:
             todo = ok_results
         else:
             todo = []
-        # v6.3 (richiesta utente): SALVATAGGIO AUTOMATICO DEI TESTI alla
-        # pressione del tasto 3 — per OGNI immagine che sta per essere
-        # spostata, il testo di FASE 1 (incluso il testo corretto con
-        # Aggiungi testo / Scansione avanzata) viene accodato a
-        # ocr_testi.txt con l'header «===== nomefile =====». Quelle già
-        # salvate sono saltate (nessun duplicato). Così, anche dopo lo
-        # spostamento in output, i testi restano disponibili per le
-        # revisioni, una scansione avanzata successiva e il dizionario.
-        _target = (self.state.input_dir or Path.cwd()) / "ocr_testi.txt"
-        _already = set(saved_ocr_texts(self.state.input_dir).keys())
-        _appended = 0
+        # v6.3 → v7.3 (testi distribuiti per gruppo): alla FASE 3 i testi
+        # NON finiscono più tutti nella root. Le immagini che stanno per
+        # essere SPOSTATE vedranno il loro testo accodato al ocr_testi.txt
+        # DEL GRUPPO di destinazione (subito dopo lo spostamento fisico);
+        # le immagini dei gruppi NON spuntati restano salvate nel file
+        # della root, com'era prima (persistenza per le sessioni future).
+        # Nessun duplicato: si salta ciò che è già presente nel file meta.
+        _input_dir = self.state.input_dir or Path.cwd()
+        _root_target = _input_dir / "ocr_testi.txt"
+        _root_already = set(saved_ocr_texts(_input_dir).keys())
+        _moved_names = {r.doc.path.name for r in todo}
+        _appended_root = 0
         try:
-            with _target.open("a", encoding="utf-8") as _fh:
-                for _r in todo:
-                    if _r.doc.path.name in _already or not _r.doc.text.strip():
+            with _root_target.open("a", encoding="utf-8", newline="") as _fh:
+                for _r in ok_results:
+                    if (
+                        _r.doc.path.name in _moved_names
+                        or _r.doc.path.name in _root_already
+                        or not _r.doc.text.strip()
+                    ):
                         continue
                     _fh.write(f"===== {_r.doc.path.name} =====\n")
                     _fh.write(_r.doc.text.strip() + "\n\n")
-                    _appended += 1
-            if _appended:
+                    _appended_root += 1
+            if _appended_root:
                 self._log(
-                    f"💾 Salvati automaticamente {_appended} testi in {_target.name} "
-                    "(quelle già salvate sono saltate)."
+                    f"💾 Salvati {_appended_root} testi nella root "
+                    "(gruppi non ancora spostati; già presenti saltati)."
                 )
         except Exception as _exc:  # noqa: BLE001
-            self._log(f"⚠️  Salvataggio automatico dei testi non riuscito: {_exc}")
+            self._log(f"⚠️  Salvataggio nella root non riuscito: {_exc}")
         self._set_busy(True)
         self._log("\n📦 FASE 3 - Spostamento delle immagini nelle cartelle per tema…")
 
         def worker() -> None:
             try:
                 moved = move_files_to_folders(todo, output_dir)
+                # v7.3: DISTRIBUTIONE dei testi — per ogni immagine spostata
+                # il testo va nel ocr_testi.txt DELLA SUA CARTELLA-GRUPPO
+                # (move_files_to_folders ha aggiornato doc.path alla dest).
+                _dist = _dupl = 0
+                for _r in todo:
+                    if _r.doc.error or not _r.doc.text.strip():
+                        continue
+                    if append_ocr_section(
+                        _r.doc.path.parent / "ocr_testi.txt",
+                        _r.doc.path.name,
+                        _r.doc.text,
+                    ):
+                        _dist += 1
+                    else:
+                        _dupl += 1
+                if _dist or _dupl:
+                    self._log(
+                        f"💾 Testi distribuiti nei gruppi: {_dist} accodati, "
+                        f"{_dupl} già presenti (niente duplicati)."
+                    )
                 report = write_report(self.state.results, output_dir)
                 self.root.after(0, lambda: self._after_move(moved, report))
             except Exception as exc:  # noqa: BLE001

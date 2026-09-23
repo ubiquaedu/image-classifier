@@ -2866,8 +2866,13 @@ class ClassifierApp:
         selected = self.results_tree.selection()
         if not selected:
             return None, ""
+        # v6.10 (richiesta utente): con la selezione multipla (Ctrl+click)
+        # selection()[0] resta sulla PRIMA riga scelta e l'anteprima non
+        # seguiva l'ultima immagine cliccata: si usa focus(), che punta
+        # sempre all'ultima riga su cui si è cliccato.
+        item = self.results_tree.focus() or selected[0]
         try:
-            values = self.results_tree.item(selected[0], "values")
+            values = self.results_tree.item(item, "values")
         except tk.TclError:
             return None, ""  # selezione obsoleta (riga ricreata)
         if not values or len(values) < 2:
@@ -2890,7 +2895,8 @@ class ClassifierApp:
         if not selected:
             return None
         try:
-            values = self.results_tree.item(selected[0], "values")
+            item = self.results_tree.focus() or selected[0]
+            values = self.results_tree.item(item, "values")
         except tk.TclError:
             return None  # selezione obsoleta (riga ricreata)
         if values and len(values) >= 2:
@@ -3969,9 +3975,8 @@ class ClassifierApp:
         if not docs:
             messagebox.showinfo(
                 "Sposta nel gruppo",
-                "Seleziona prima un'immagine nella tabella. (Ctrl+click o Maiusc+click per selezionarne piu di una.)",
-                "(La selezione multipla funziona pure con Maiusc+click.)",
-                "(Ctrl+click o Maiusc+click per selezionarne PIÙ di una.)",
+                "Seleziona prima un'immagine nella tabella "
+                "(Ctrl+click o Maiusc+click per selezionarne più di una).",
             )
             return
         # v6.3: MULTI-SELEZIONE — _assign_docs è la lista completa;
