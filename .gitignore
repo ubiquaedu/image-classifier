@@ -21,3 +21,6 @@ gruppi_frequenze.csv
 Thumbs.db
 Desktop.ini
 *.bak
+
+# Demo web (non inclusa nel repo)
+demo/
